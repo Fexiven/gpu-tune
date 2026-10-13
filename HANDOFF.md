@@ -59,6 +59,14 @@ The two must always be used together (README explains this to users).
     Actions CI added (`.github/workflows/ci.yml`: fmt, clippy, tests, nix build).
     Repo: https://github.com/Fexiven/gpu-tune. Commit as the user (Fexiven), not as the AI.
 
+11. v0.7, from the user's first v0.6 run (§6b): memory pick judged over the whole range
+    (`pick_mem`: bandwidth per MHz vs the best so far, gain vs the lowest), capped
+    `MEM_ERROR_MARGIN` (500) below the first offset with errors (`PassState::mem_err`, carried
+    into pass 2); smallest offset at the voltage floor (`floor_offset`, uses the game-like
+    power saved with each core search step as `{"ok":true,"pp":W}`); stock measured three
+    times; report says why each power limit was chosen (`Prof::power_note`) and compares
+    Performance with Balanced.
+
 ## 4. Architecture (src/)
 
 | file | role |
@@ -83,7 +91,7 @@ Key mechanisms worth knowing before changing anything:
   `soaks[name].at` the same way and backs off one step after a crash. Keys encode all settings.
 - **Errors**: `Stop::Interrupted` (Ctrl+C), `Stop::Thermal` (cooling can't keep up; overheating
   is never counted as instability), `Stop::Fatal` (GPU gone, reboot), `Stop::Exit` (message).
-- **Noise**: stock is measured twice; thresholds use max(fixed floor, 2× measured noise).
+- **Noise**: stock is measured three times (spread = (max-min)/mean); thresholds use max(fixed floor, 2× measured noise).
 - **Memory decisions** use measured clocks (`mem_step_worth_it`): a step counts only if bandwidth
   rises by ≥ half the clock increase and > 2× noise (GDDR6X error detection & replay eats
   bandwidth when overclocked too far). Errors from the pattern check stop the sweep.
@@ -98,7 +106,7 @@ Key mechanisms worth knowing before changing anything:
 
 | what | how verified |
 |---|---|
-| whole tuning flow, crashes, reboots, Ctrl+C, overheat, three profiles, power search, calibrations, estimates | `cargo test`: 33 tests incl. simulated card (`sim.rs`) |
+| whole tuning flow, crashes, reboots, Ctrl+C, overheat, three profiles, power search, calibrations, estimates | `cargo test`: 38 tests incl. simulated card (`sim.rs`) |
 | Vulkan loads run, are deterministic, detect injected errors | lavapipe in the dev container: `gpu-tune --self-test --vulkan-device any --width 320 --height 192 --mem-mb 64`; user's 4080 SUPER: `--self-test` all ok, P0 |
 | VRAM temperature via NvAPI | user's card: `--check-vram` ok |
 | NixOS flake builds and runs | user's machine (v0.2); CI builds it on every push (`nix build`) |
@@ -124,9 +132,28 @@ First thing to do with new hardware results: read the CSV log (`gpu_tune_log_*.c
   heavy game crashes. User applied it in LACT (screenshot confirmed values).
 - During the memory sweep the user saw screen artifacts (expected: display reads VRAM).
 
+## 6b. Real data from the user's card (v0.6 run, 98 min, driver 595.104.02)
+
+- Stock: full load 319.5 W, limited by power, alu 64 was enough; game-like load 37 steps/pass,
+  ~49% busy, 0 missed. Stock boost (game-like) ~2706 MHz → auto caps 2400/2550/2700/2850.
+- Core: errors always appeared first in the **full load**, 15-30 MHz below crashes, often only
+  5-30 wrong values; the game-like load passed offsets the full load failed. Pass 2 limits:
+  2670 → +300, 2700 → +300, 2730 → +285, 2820/2850/2880 → +270. Pass 1 and 2 agreed (2850: +270).
+- Voltage floor: at 2400 every offset up to +450 passed and game-like power stayed ~100 W from
+  +225 on; same at 2550 from +225. Motivated `floor_offset`.
+- Memory: cool errors at +3500 (13251 MHz); hot +2500..+3250 clean, bandwidth per MHz constant
+  (no retries). v0.6 picked +2500 because each 250 step (+1.1%) was below 2× noise (1.56%):
+  the bug fixed in v0.7. memtest_vulkan (user) showed the memory at 96 °C; the tuner's combo
+  load peaked at 88 °C.
+- Power search: no knee within the budgets; step cost 0.28-0.37 at 2670 MHz/+255.
+  Efficient 270 W (−2.2%, −7.0%), stopped by the 3% cap at 260 W; Balanced 310 W (−0.7%,
+  −3.3%), stopped by the 1% cap at 300 W. Max limit 352 W: +2.0% perf for +10% power.
+- Result v0.6: Efficient 2670/+255/+2500/270 W, Balanced 2850/+225/+2500/310 W, Performance
+  2880/+225/+2500/352 W; all soaks passed first try.
+
 ## 7. Open work / ideas (rough priority)
 
-1. **Get a v0.6 run log from the user** and check §5's list. Likely tuning needed: `alu` range,
+1. **Get a v0.7 run log from the user** (expect memory +3000, see §6b) and check §5's list. Likely tuning needed: `alu` range,
    paced sizing, time estimates on real hardware.
 2. **V/F curve editing via NvAPI** (LACT has it: `QUERY_NVAPI_GPU_CLOCK_CLIENT_CLK_VF_POINTS_*` in
    LACT's `nvapi.rs`). A real undervolt curve would leave the low idle points untouched instead

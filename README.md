@@ -4,7 +4,7 @@ Automatic overclock / undervolt finder for NVIDIA GPUs on Linux. It finds three 
 profiles for your card (**efficient**, **balanced**, **performance**), each a core clock offset,
 clock cap and memory offset, and tells you what to enter in
 [LACT](https://github.com/ilya-zlobintsev/LACT) (save them as LACT profiles). It takes about
-1 hour 50 minutes (`--single`: one profile, ~80 min), and you can stop and continue at any time.
+1 hour 40 minutes (`--single`: one profile, ~80 min), and you can stop and continue at any time.
 
 Made for the RTX 4080 Super; works on RTX 30/40/50 cards with the proprietary driver (555+ recommended).
 
@@ -69,7 +69,7 @@ pattern and checks every word. Each test runs in its own process, so a crash onl
 
 **Steps:**
 
-1. Stock performance, measured twice to know the run-to-run noise. Every later decision must
+1. Stock performance, measured three times to know the run-to-run noise. Every later decision must
    beat twice that noise, so random variation can't pick the result. Both test loads calibrate
    themselves here: the full load gets heavier until it reaches the power limit (like a heavy
    game: an undervolt that holds at low power can still crash at high power, where more current
@@ -77,14 +77,19 @@ pattern and checks every word. Each test runs in its own process, so a crash onl
    real idle gaps between frames.
 2. Calibration: tests must run in P0; the memory offset's real effect is measured; a +60 core
    offset must actually raise the clock (otherwise the search would find nothing real).
-3. Memory: the bandwidth peak. Too much memory clock causes transfer retries (GDDR6X error
-   detection and replay), which show up as lost bandwidth. The best steps are re-checked with a
-   hot GPU, and a step only counts if it clearly adds bandwidth.
+3. Memory: too much memory clock causes transfer retries (GDDR6X error detection and replay),
+   which show up as bandwidth that no longer follows the clock, and then as wrong data. The
+   tuner keeps the highest offset where bandwidth per MHz still holds, judged over the whole
+   range (one small step adds less than the noise, the range as a whole doesn't), re-checked with
+   a hot GPU, and always at least 500 below the first offset that showed errors.
 4. Core: for four clock caps around your card's stock boost clock (300 MHz below to 150 MHz
    above, never above the driver's maximum; or your own list with `--clocks`), a binary search for the highest stable offset. Each step runs
    the game-like load (bursts at 120 fps, load changing every frame) and then the full load at
    the power limit. A higher offset at the same clock cap means lower voltage, so less power. The
-   result is used with a 45 MHz safety margin (longer tests find lower limits).
+   result is used with a 45 MHz safety margin (longer tests find lower limits). At low clock
+   caps the voltage is already at its minimum, so beyond some offset power stops falling; there
+   the tuner uses the smallest offset that reaches it (more would only raise the idle points of
+   the curve, where Linux undervolts crash, for no gain).
 5. Pass 2 repeats steps 3-4 around each profile's area with full-length tests and finer steps.
 6. Power limit (efficient and balanced profiles): full load with the profile's settings, first
    at the default limit, then in 10 W steps down from what it actually draws. At first a lower
@@ -92,7 +97,8 @@ pattern and checks every word. Each test runs in its own process, so a crash onl
    no voltage left to drop and only loses clock speed, so every watt saved costs performance.
    The search stops at that knee (a step that costs more than 0.6% performance per 1% power),
    or when the total loss passes 3% (efficient) or 1% (balanced). The last limit before it is
-   kept if it saves clearly more power than the noise (at least 3%).
+   kept if it saves clearly more power than the noise (at least 3%). The report says why the
+   search stopped where it did.
    The performance profile instead checks whether the card's maximum limit adds performance.
    (The offset stays the same while the limit changes: stability is decided at the highest
    current, at the clock cap, and a lower limit only moves the card down the same curve. The
@@ -135,7 +141,8 @@ the tuner never tested.
 1. Enter the values in LACT (P0 row if it shows one row per P-state). The report also tells you
    which memory clock `nvidia-smi` should show in a game, so you can check the offset units.
 2. Run [memtest_vulkan](https://github.com/GpuZelenograd/memtest_vulkan) once: bandwidth tests
-   can't prove the memory is error-free.
+   can't prove the memory is error-free. It heats the memory more than any game (mid-90s °C
+   on a 4080 Super is normal there); what matters is that it finds no errors.
 3. Play your games for a few days, and use the desktop normally (idle, videos).
    - Game crashes or driver reset: lower the GPU clock offset by 15-30
    - Crashes at idle / on the desktop: lower the GPU clock offset by 15-30

@@ -142,6 +142,7 @@ pub fn tune(e: &Env, base_args: &PassArgs, goal: &str, quick_only: bool, single:
     p2.hints = interpolate_hints(&found1, &p2.clocks);
     p2.refine_mem = Some(m1);
     p2.refine_mem_top = t1.st.mem_top_of_range;
+    p2.refine_mem_err = t1.st.mem_err;
     let mut st2 = take(Pass::P2);
     if !st2.plan.is_empty() && st2.plan != p2.clocks {
         st2.clocks.clear();

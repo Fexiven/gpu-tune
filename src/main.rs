@@ -37,7 +37,7 @@ use ui::{Log, PlainUi, Tone, Ui};
     about = "Automatic overclock / undervolt finder for NVIDIA GPUs on Linux.",
     long_about = "Finds the best stable clock offset, clock cap and memory offset for your NVIDIA card, \
                         tested with Vulkan loads like games, and tells you what to enter in LACT.\n\n\
-                        Finds three profiles (efficient, balanced, performance), each soak-tested, in about 1 hour 50 minutes (--single: one profile, ~75 min; --quick-only: ~45 min). Ctrl+C stops safely at any time \
+                        Finds three profiles (efficient, balanced, performance), each soak-tested, in about 1 hour 40 minutes (--single: one profile, ~75 min; --quick-only: ~45 min). Ctrl+C stops safely at any time \
                         (GPU goes back to stock); run it again to continue where it stopped."
 )]
 struct Cli {
@@ -223,6 +223,7 @@ fn base_args(cli: &Cli, gpu: &dyn Gpu) -> PassArgs {
         hints: Default::default(),
         refine_mem: None,
         refine_mem_top: false,
+        refine_mem_err: None,
         core_max: cli.core_max.min(gpu.info().core_range.1).max(0),
         core_step: cli.core_step.max(1),
         core_margin: cli.core_margin.max(0),

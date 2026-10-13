@@ -28,6 +28,8 @@ struct Card {
     heavy_max_w: f64,
     /// below this power the voltage is at its floor: every watt saved costs ~1:1 performance
     vmin_w: f64,
+    /// lowest relative voltage of the V/F curve: more offset doesn't lower it further
+    volt_floor: f64,
 }
 
 impl Default for Card {
@@ -45,6 +47,7 @@ impl Default for Card {
             paced_scale: 1.0,
             heavy_max_w: 400.0,
             vmin_w: 0.0,
+            volt_floor: 0.0,
         }
     }
 }
@@ -218,7 +221,7 @@ impl Runner for FakeRunner {
                 return crash(summ.clone());
             }
             let clk = (s.clock.map_or(f64::MAX, |x| x as f64)).min(c.stock_boost + core as f64);
-            let volt = (clk - core as f64) / c.stock_boost;
+            let volt = ((clk - core as f64) / c.stock_boost).max(c.volt_floor);
             let mut r = WorkResult {
                 mem_errors,
                 ..Default::default()
@@ -323,6 +326,7 @@ fn args(gpu: &FakeGpu) -> PassArgs {
         hints: Default::default(),
         refine_mem: None,
         refine_mem_top: false,
+        refine_mem_err: None,
         core_max: 450,
         core_step: 15,
         core_margin: 45,
@@ -553,6 +557,54 @@ fn clock_scan_follows_the_cards_stock_boost() {
     });
     assert_eq!(r.res, Ok(()), "{:?}", r.events);
     assert_eq!(keys(&r), vec![2250, 2400, 2550, 2700]);
+}
+
+#[test]
+fn memory_without_retries_stays_below_the_first_errors() {
+    // like the user's card: bandwidth follows the clock all the way, errors from ~13100 MHz
+    // (+3200): the cool sweep sees errors at +3500, so the pick is +3000 (500 below)
+    let r = run(Card {
+        retry_knee: 99_999.0,
+        mem_ok_cool: 13_100.0,
+        mem_ok_hot: 13_100.0,
+        ..Default::default()
+    });
+    assert_eq!(r.res, Ok(()), "{:?}", r.events);
+    assert_eq!(r.state.p1.mem_err, Some(3500));
+    assert_eq!(r.state.p1.mem, Some(3000), "{:?}", r.events);
+    assert_eq!(r.state.p2.mem, Some(3000), "{:?}", r.events);
+    // pass 2 never tested above the cap
+    assert!(!r.state.p2.tried.contains_key("memhot:3250"));
+    for p in r.state.result.as_ref().unwrap().profiles.values() {
+        assert_eq!(p.mem, 3000, "{p:?}");
+    }
+}
+
+#[test]
+fn offset_stops_where_the_voltage_floor_is_reached() {
+    // at the lowest cap (2490) the voltage floor is reached from about +110: more offset saves
+    // no power, so the tuner keeps the smallest tested offset at the floor (the search tested
+    // +225 there) instead of the stable maximum minus the margin (+285)
+    let r = run(Card {
+        volt_floor: 0.85,
+        ..Default::default()
+    });
+    assert_eq!(r.res, Ok(()), "{:?}", r.events);
+    let p = r.state.p1.clocks[&2490].as_ref().unwrap();
+    assert!(p.core < p.max_stable - 45, "{p:?}");
+    assert!(p.max_stable > 250, "{p:?}");
+    assert!(r.events.iter().any(|e| e.contains("power stops falling")));
+    // higher caps aren't at the floor: margin rule as usual
+    let p = r.state.p1.clocks[&2940].as_ref().unwrap();
+    assert_eq!(p.core, p.max_stable - 45, "{p:?}");
+}
+
+#[test]
+fn report_explains_power_limits_and_compares_performance_with_balanced() {
+    let r = run(Card::default());
+    let t = crate::report::report_text(&FakeGpu::new(Card::default()), &r.state, "balanced");
+    assert!(t.contains("why this limit:  stopped here because"), "{t}");
+    assert!(t.contains("vs Balanced:"), "{t}");
 }
 
 #[test]

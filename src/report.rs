@@ -75,6 +75,21 @@ pub fn report_text(gpu: &dyn Gpu, st: &State, _goal: &str) -> String {
             "   LACT (P0):       GPU clock offset {:+}, VRAM clock offset {:+}, maximum GPU clock {} MHz, power limit {pl}",
             p.core, p.mem, p.max_clock
         ));
+        if let Some(note) = &p.power_note {
+            l.push(format!("   why this limit:  {note}"));
+        }
+        if name == "max"
+            && let Some(bal) = res.profiles.get("balanced")
+            && bal != p
+        {
+            l.push(format!(
+                "   vs Balanced:     full load {:+.1}% for {:+.0} W, game-like clock {:+.1}% for {:+.0} W",
+                (p.perf / bal.perf - 1.0) * 100.0,
+                p.heavy_power - bal.heavy_power,
+                (p.paced_clk / bal.paced_clk.max(1.0) - 1.0) * 100.0,
+                p.paced_power - bal.paced_power
+            ));
+        }
         if let Some(v) = p.vram_max {
             l.push(format!(
                 "   memory temp:     up to {v:.0}°C in the soak test{}",

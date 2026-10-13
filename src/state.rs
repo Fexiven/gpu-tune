@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-pub const STATE_VERSION: u32 = 7;
+pub const STATE_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Noise {
@@ -65,6 +65,9 @@ pub struct Prof {
     pub power_limit_mw: Option<u32>,
     #[serde(default)]
     pub vram_max: Option<f64>,
+    /// why the power-limit search stopped where it did (shown in the report)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_note: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -83,6 +86,9 @@ pub struct PassState {
     pub mem: Option<i32>,
     pub mem_bw: Option<f64>,
     pub mem_top_of_range: bool,
+    /// lowest memory offset that showed errors (the pick stays MEM_ERROR_MARGIN below it)
+    #[serde(default)]
+    pub mem_err: Option<i32>,
     pub bw_noise: Option<f64>,
     pub clocks: BTreeMap<u32, Option<Prof>>,
     /// result of every test step, by key; survives crashes and reboots

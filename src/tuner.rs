@@ -24,6 +24,8 @@ pub struct PassArgs {
     pub hints: BTreeMap<u32, i32>,
     pub refine_mem: Option<i32>,
     pub refine_mem_top: bool,
+    /// pass 2: lowest memory offset that showed errors in pass 1
+    pub refine_mem_err: Option<i32>,
     // global
     pub core_max: i32,
     pub core_step: i32,
@@ -64,6 +66,7 @@ impl PassArgs {
         p.hints.clear();
         p.refine_mem = None;
         p.refine_mem_top = false;
+        p.refine_mem_err = None;
         p
     }
 }
@@ -111,13 +114,26 @@ pub const KNEE_ELASTICITY: f64 = 0.6;
 /// Changes in power below this (relative) mean the limit didn't bite: ignore the step.
 const MIN_STEP_SAVE: f64 = 0.005;
 
+/// Why the power-limit search stopped at a step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PowerStop {
+    /// this step cost clearly more performance than the power it saved
+    Knee,
+    /// the total performance loss went over the profile's budget
+    LossCap,
+}
+
 /// `points[0]` = (performance, power) at the default limit, then lower limits in order.
-/// True while the latest step still looks worth it, i.e. the search should continue.
-pub fn keep_going(points: &[(f64, f64)], max_loss: f64, max_elast: f64) -> bool {
+/// The step that stopped the search and why (None = keep going).
+pub fn power_stop(
+    points: &[(f64, f64)],
+    max_loss: f64,
+    max_elast: f64,
+) -> Option<(usize, PowerStop)> {
     pick_steps(points, max_loss, max_elast).1
 }
 
-/// The sweet spot among `points` (see `keep_going`): the lowest limit reached while every step
+/// The sweet spot among `points` (see `power_stop`): the lowest limit reached while every step
 /// cost at most `max_elast` x the power it saved and the total loss stayed within `max_loss`.
 /// None if it doesn't save at least `min_save` power.
 pub fn pick_knee(
@@ -131,27 +147,50 @@ pub fn pick_knee(
     best.filter(|&i| 1.0 - points[i].1 / w0 >= min_save)
 }
 
-fn pick_steps(points: &[(f64, f64)], max_loss: f64, max_elast: f64) -> (Option<usize>, bool) {
+type Steps = (Option<usize>, Option<(usize, PowerStop)>);
+
+fn pick_steps(points: &[(f64, f64)], max_loss: f64, max_elast: f64) -> Steps {
     let Some(&(p0, w0)) = points.first() else {
-        return (None, false);
+        return (None, None);
     };
     let (mut best, mut last_loss, mut last_save) = (None, 0.0, 0.0);
     for (i, &(perf, power)) in points.iter().enumerate().skip(1) {
         let (loss, save) = (1.0 - perf / p0, 1.0 - power / w0);
         if loss > max_loss {
-            return (best, false);
+            return (best, Some((i, PowerStop::LossCap)));
         }
         let ds = save - last_save;
         if ds < MIN_STEP_SAVE {
             continue; // the limit didn't bite (yet): nothing to judge
         }
         if (loss - last_loss) / ds > max_elast {
-            return (best, false); // the knee: from here on power is bought with performance
+            // the knee: from here on power is bought with performance
+            return (best, Some((i, PowerStop::Knee)));
         }
         (last_loss, last_save) = (loss, save);
         best = Some(i);
     }
-    (best, true)
+    (best, None)
+}
+
+pub fn mean(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        0.0
+    } else {
+        v.iter().sum::<f64>() / v.len() as f64
+    }
+}
+
+/// Run-to-run noise of repeated measurements: (max - min) / mean.
+pub fn spread(v: &[f64]) -> f64 {
+    let m = mean(v);
+    if m.abs() <= 0.0 {
+        return 0.0;
+    }
+    let (lo, hi) = v
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(l, h), x| (l.min(*x), h.max(*x)));
+    (hi - lo) / m.abs()
 }
 
 pub fn rel_noise(a: f64, b: f64) -> f64 {
@@ -159,15 +198,68 @@ pub fn rel_noise(a: f64, b: f64) -> f64 {
     if m > 0.0 { (a - b).abs() / m } else { 0.0 }
 }
 
-/// A higher memory offset only counts if it delivers at least half of the bandwidth gain its
-/// measured clock increase should give, and clearly more than the measurement noise. Less
-/// than that means transfer retries (error detection and replay) are eating the gain.
-pub fn mem_step_worth_it(clk_hi: f64, bw_hi: f64, clk_lo: f64, bw_lo: f64, noise: f64) -> bool {
-    if bw_lo <= 0.0 || clk_lo <= 0.0 || clk_hi <= clk_lo {
-        return false;
+/// Why the memory pick stopped where it did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MemStop {
+    /// every offset tested kept its bandwidth: the pick is the highest one tested
+    Top,
+    /// from this offset on the bandwidth stopped following the clock (transfer retries)
+    Retries(i32),
+    /// the highest offset didn't add clearly more bandwidth than the noise: kept the lowest
+    NoGain,
+}
+
+/// Memory offsets that passed, sorted ascending: (offset, bandwidth, measured clock).
+/// GDDR6X detects transfer errors and replays them, so a too-high memory clock first shows up
+/// as bandwidth that no longer follows the clock. The pick is the highest offset up to which
+/// bandwidth per MHz stays within the noise of the best seen so far, judged over the whole
+/// range (small steps add less than the noise each, so step-by-step tests can't see them), and
+/// it must add at least half the bandwidth its clock increase should give, and clearly more
+/// than the noise, over the lowest offset.
+pub fn pick_mem(pts: &[(i32, f64, f64)], noise: f64) -> (usize, MemStop) {
+    if pts.len() < 2 || pts[0].1 <= 0.0 || pts[0].2 <= 0.0 {
+        return (0, MemStop::Top);
     }
-    let ideal = clk_hi / clk_lo - 1.0;
-    bw_hi / bw_lo - 1.0 >= (0.5 * ideal).max(2.0 * noise)
+    let tol = 0.005f64.max(2.0 * noise);
+    let eff = |p: &(i32, f64, f64)| p.1 / p.2;
+    let (mut best_eff, mut top, mut stop) = (eff(&pts[0]), 0, MemStop::Top);
+    for (i, p) in pts.iter().enumerate().skip(1) {
+        if p.2 <= 0.0 || eff(p) < best_eff * (1.0 - tol) {
+            stop = MemStop::Retries(p.0);
+            break;
+        }
+        best_eff = best_eff.max(eff(p));
+        top = i;
+    }
+    let (p0, pt) = (&pts[0], &pts[top]);
+    let (gain, ideal) = (pt.1 / p0.1 - 1.0, pt.2 / p0.2 - 1.0);
+    if top > 0 && gain < (0.5 * ideal).max(2.0 * noise) {
+        return (0, MemStop::NoGain);
+    }
+    (top, stop)
+}
+
+/// Memory offsets this far below the first one that showed errors are the most the tuner uses.
+pub const MEM_ERROR_MARGIN: i32 = 500;
+
+/// At low clock caps the voltage is already at its minimum: beyond some offset the power stops
+/// falling, and more offset only raises the low (idle) points of the curve for nothing.
+/// `pts` = (offset, game-like power) of the stable search steps at one clock cap. Returns the
+/// smallest offset whose power is within `tol` of the lowest, if that's below the highest tested.
+pub fn floor_offset(pts: &[(i32, f64)], tol: f64) -> Option<i32> {
+    let mut v: Vec<(i32, f64)> = pts.iter().copied().filter(|p| p.1 > 0.0).collect();
+    if v.len() < 3 {
+        return None;
+    }
+    v.sort_by_key(|p| p.0);
+    let min = v.iter().map(|p| p.1).fold(f64::MAX, f64::min);
+    let flat = |p: &(i32, f64)| p.1 <= min * (1.0 + tol);
+    let first = v.iter().find(|p| flat(p))?.0;
+    // only meaningful if at least two higher offsets confirm the flat part, and all of them
+    // stay flat (above the stock boost clock more offset means more clock and more power:
+    // that's an overclock, not a floor)
+    let above: Vec<_> = v.iter().filter(|p| p.0 > first).collect();
+    (above.len() >= 2 && above.iter().all(|p| flat(p))).then_some(first)
 }
 
 /// Core clock in the game-like load vs stock. There the card is not power-limited (like in
@@ -180,6 +272,12 @@ pub fn game_rel(r: &Prof, base: &Baseline) -> f64 {
     } else {
         1.0
     }
+}
+
+/// A core search step's saved result: `true` / `{"ok": true, ...}` = stable.
+fn step_ok(v: &Value) -> bool {
+    v.as_bool()
+        .unwrap_or_else(|| v["ok"].as_bool().unwrap_or(false))
 }
 
 /// Binary search for the highest offset where `run` passes. Returns (lo, hi) with lo stable,
@@ -716,9 +814,9 @@ impl<'a> Tuner<'a> {
             return Ok(b);
         }
         self.ui.set_phase(
-            "Measuring stock performance (twice)",
-            "Your card at default settings, warmed up. Measured twice to know how much results vary by chance, \
-             so later decisions ignore that noise.",
+            "Measuring stock performance (three times)",
+            "Your card at default settings, warmed up. Measured three times to know how much results vary by \
+             chance, so later decisions ignore that noise.",
         );
         let s0 = self.set(0, 0, None);
         let fail = |m: &str| Stop::Exit(format!("{m} See the log file."));
@@ -774,6 +872,10 @@ impl<'a> Tuner<'a> {
         let heavy2 = heavy2
             .filter(|_| ok)
             .ok_or_else(|| fail("The second stock test failed: the card is unstable at stock."))?;
+        let (ok, heavy3) = self.test(Kind::Heavy, s0, self.a.measure, 5.0, None, true)?;
+        let heavy3 = heavy3
+            .filter(|_| ok)
+            .ok_or_else(|| fail("The third stock test failed: the card is unstable at stock."))?;
 
         // Game-like load: about 60% busy at the target frame rate, so there are real idle gaps
         // between frames (load changes every frame, like a game). Adjusts the passes per frame
@@ -830,19 +932,25 @@ impl<'a> Tuner<'a> {
         let paced2 = paced2
             .filter(|_| ok)
             .ok_or_else(|| fail("The second stock game-like test failed."))?;
-        let m = |a: f64, b: f64| (a + b) / 2.0;
+        let (ok, paced3) = self.test(Kind::Paced, s0, self.a.measure, 0.0, None, true)?;
+        let paced3 = paced3
+            .filter(|_| ok)
+            .ok_or_else(|| fail("The third stock game-like test failed."))?;
+        let hs = [&heavy, &heavy2, &heavy3];
+        let ps = [&paced, &paced2, &paced3];
+        let (m, sp) = (mean, spread);
         let b = Baseline {
-            perf: m(heavy.perf, heavy2.perf),
-            heavy_power: m(heavy.avg_power, heavy2.avg_power),
-            heavy_clk: m(heavy.core_clk, heavy2.core_clk),
-            paced_power: m(paced.avg_power, paced2.avg_power),
-            paced_clk: m(paced.core_clk, paced2.core_clk),
-            pstate: paced2.pstate,
+            perf: m(&hs.map(|r| r.perf)),
+            heavy_power: m(&hs.map(|r| r.avg_power)),
+            heavy_clk: m(&hs.map(|r| r.core_clk)),
+            paced_power: m(&ps.map(|r| r.avg_power)),
+            paced_clk: m(&ps.map(|r| r.core_clk)),
+            pstate: paced3.pstate,
             noise: Noise {
-                perf: rel_noise(heavy.perf, heavy2.perf),
-                heavy_power: rel_noise(heavy.avg_power, heavy2.avg_power),
-                paced_power: rel_noise(paced.avg_power, paced2.avg_power),
-                clk: rel_noise(paced.core_clk, paced2.core_clk),
+                perf: sp(&hs.map(|r| r.perf)),
+                heavy_power: sp(&hs.map(|r| r.avg_power)),
+                paced_power: sp(&ps.map(|r| r.avg_power)),
+                clk: sp(&ps.map(|r| r.core_clk)),
             },
             heavy_limited: limited,
             power_limit_w: pl_w,
@@ -1022,6 +1130,9 @@ impl<'a> Tuner<'a> {
                 .into_iter()
                 .filter(|o| *o >= 0 && *o <= self.a.mem_max)
                 .collect();
+            if self.st.mem_err.is_none() {
+                self.st.mem_err = self.a.refine_mem_err;
+            }
             if self.a.refine_mem_top && m + 2 * step <= self.a.mem_max {
                 c.push(m + 2 * step);
             }
@@ -1103,8 +1214,12 @@ impl<'a> Tuner<'a> {
             }
             let r = self.mem_probe(&format!("mem:{off}"), off, false)?;
             let (Some(bw), Some(clk)) = (r["bw"].as_f64(), r["mem_clk"].as_f64()) else {
-                self.ui
-                    .event("•", "memory limit reached (errors or crash)", Tone::Warn);
+                self.ui.event(
+                    "•",
+                    &format!("memory limit reached at +{off} (errors or crash)"),
+                    Tone::Warn,
+                );
+                self.note_mem_err(off);
                 break;
             };
             results.push((off, bw, clk));
@@ -1131,12 +1246,10 @@ impl<'a> Tuner<'a> {
             );
             return Ok((0, None, false));
         }
-        let mut best = results[0];
-        for r in &results[1..] {
-            if mem_step_worth_it(r.2, r.1, best.2, best.1, noise) {
-                best = *r;
-            }
-        }
+        let cap = self.mem_cap();
+        results.retain(|r| r.0 <= cap);
+        let (i, _) = pick_mem(&results, noise);
+        let best = results[i];
         let top = best.0 + self.a.mem_step > self.a.mem_max.min(lim);
         self.ui.event(
             "•",
@@ -1165,18 +1278,41 @@ impl<'a> Tuner<'a> {
         Ok((chosen, bw, top && chosen == best.0))
     }
 
+    /// Highest memory offset the tuner may use: MEM_ERROR_MARGIN below the first errors.
+    fn mem_cap(&self) -> i32 {
+        self.st.mem_err.map_or(i32::MAX, |e| e - MEM_ERROR_MARGIN)
+    }
+
+    fn note_mem_err(&mut self, off: i32) {
+        self.st.mem_err = Some(self.st.mem_err.map_or(off, |e| e.min(off)));
+        self.save();
+    }
+
     fn hot_pick(&mut self, cands: &[i32]) -> R<(i32, Option<f64>)> {
         let noise = self.st.bw_noise.unwrap_or(0.0);
-        let mut c = cands.to_vec();
+        let mut c: Vec<i32> = cands.to_vec();
         c.sort_unstable();
         c.dedup();
+        if let Some(e) = self.st.mem_err {
+            let cap = self.mem_cap();
+            if c.iter().any(|o| *o > cap) {
+                self.ui.event(
+                    "•",
+                    &format!("errors started at +{e}: staying at +{cap} or below"),
+                    Tone::Normal,
+                );
+            }
+        }
         let mut hot: BTreeMap<i32, (f64, f64)> = BTreeMap::new();
         for off in c {
-            if off > self.mem_limit() {
+            if off > self.mem_limit() || off > self.mem_cap() {
                 break;
             }
             let r = self.mem_probe(&format!("memhot:{off}"), off, true)?;
             let (Some(bw), Some(clk)) = (r["bw"].as_f64(), r["mem_clk"].as_f64()) else {
+                self.ui
+                    .event("•", &format!("+{off} failed with a hot GPU"), Tone::Warn);
+                self.note_mem_err(off);
                 break;
             };
             if let Some(vt) = r["vram_temp"].as_f64()
@@ -1193,32 +1329,36 @@ impl<'a> Tuner<'a> {
             }
             hot.insert(off, (bw, clk));
         }
-        let Some(&first) = hot.keys().next() else {
+        let cap = self.mem_cap();
+        let pts: Vec<(i32, f64, f64)> = hot
+            .iter()
+            .filter(|(o, _)| **o <= cap)
+            .map(|(&o, &(bw, clk))| (o, bw, clk))
+            .collect();
+        if pts.is_empty() {
             return Ok((0, None));
-        };
-        let mut chosen = first;
-        for (&off, &(bw, clk)) in hot.iter().skip(1) {
-            let (cbw, cclk) = hot[&chosen];
-            if mem_step_worth_it(clk, bw, cclk, cbw, noise) {
-                chosen = off;
-            } else {
-                let gain = (bw / cbw - 1.0) * 100.0;
-                let what = if gain < 0.0 {
-                    format!("is slower ({gain:+.1}%)")
-                } else {
-                    format!("adds only {gain:+.1}% bandwidth")
-                };
-                self.ui.event(
-                    "•",
-                    &format!("+{off} {what}: keeping the safer +{chosen}"),
-                    Tone::Normal,
-                );
-                break;
-            }
+        }
+        let (i, stop) = pick_mem(&pts, noise);
+        let chosen = pts[i].0;
+        match stop {
+            MemStop::Retries(o) => self.ui.event(
+                "•",
+                &format!("+{o} loses bandwidth per MHz (transfer retries): keeping +{chosen}"),
+                Tone::Normal,
+            ),
+            MemStop::NoGain => self.ui.event(
+                "•",
+                &format!(
+                    "+{} adds no clear bandwidth over +{chosen}: keeping +{chosen}",
+                    pts.last().unwrap().0
+                ),
+                Tone::Normal,
+            ),
+            MemStop::Top => {}
         }
         self.ui
             .event("★", &format!("memory offset +{chosen}"), Tone::Star);
-        Ok((chosen, Some(hot[&chosen].0)))
+        Ok((chosen, Some(pts[i].1)))
     }
 
     fn show_mem(&self, label: &str, mem: i32, bw: Option<f64>) {
@@ -1285,11 +1425,15 @@ impl<'a> Tuner<'a> {
                 |off| {
                     let s = self.set(off, mem, Some(clk));
                     let v = self.probe(&format!("core:{clk}:{mem}:{off}"), |t| {
-                        let ok = t.test(Kind::Paced, s, secs, 0.0, None, false)?.0
-                            && t.test(Kind::Heavy, s, secs * 0.5, 0.0, None, false)?.0;
-                        Ok(Value::Bool(ok))
+                        let (ok, p) = t.test(Kind::Paced, s, secs, 0.0, None, false)?;
+                        let ok = ok && t.test(Kind::Heavy, s, secs * 0.5, 0.0, None, false)?.0;
+                        // game-like power: shows where more offset stops lowering the voltage
+                        Ok(match p.filter(|_| ok) {
+                            Some(p) => json!({"ok": true, "pp": p.avg_power}),
+                            None => Value::Bool(false),
+                        })
                     })?;
-                    Ok(v.as_bool().unwrap_or(false))
+                    Ok(step_ok(&v))
                 },
                 hint,
                 prev,
@@ -1316,6 +1460,23 @@ impl<'a> Tuner<'a> {
                 &format!("max {clk}: stable up to +{lo}, measuring with +{off} (safety margin)"),
                 Tone::Normal,
             );
+            let pts: Vec<(i32, f64)> = (0..=lo)
+                .filter_map(|o| {
+                    let v = self.st.tried.get(&format!("core:{clk}:{mem}:{o}"))?;
+                    Some((o, v["pp"].as_f64()?))
+                })
+                .collect();
+            let tol = 0.015f64.max(2.0 * base.noise.paced_power);
+            if let Some(f) = floor_offset(&pts, tol).filter(|f| *f < off) {
+                self.ui.event(
+                    "•",
+                    &format!(
+                        "max {clk}: power stops falling above +{f} (the voltage is at its minimum), so +{f} is enough"
+                    ),
+                    Tone::Normal,
+                );
+                off = f;
+            }
             self.ui.set_phase(
                 &format!("Core: measuring max {clk} MHz with a safety margin"),
                 "Full load for performance, game-like load for power at a fixed frame rate.",
@@ -1367,6 +1528,7 @@ impl<'a> Tuner<'a> {
             power_max: false,
             power_limit_mw: None,
             vram_max: None,
+            power_note: None,
         })
         .unwrap())
     }
@@ -1494,9 +1656,11 @@ impl<'a> Tuner<'a> {
         // first limit that actually binds: the next 10 W step below the measured draw
         let mut w = ((w0 - 2.0) / 10.0).floor() * 10.0;
         let mut points: Vec<(u32, f64, f64)> = vec![(info.default_pl, p0, w0)];
+        let mut ended = format!("{floor_w:.0} W is the lowest limit it tries");
         while w >= floor_w {
             let mw = (w * 1000.0) as u32;
             let Some((perf, power)) = run(self, mw, 5.0)? else {
+                ended = format!("{w:.0} W was unstable with these settings");
                 self.ui.event(
                     "•",
                     &format!(
@@ -1517,7 +1681,17 @@ impl<'a> Tuner<'a> {
             );
             points.push((mw, perf, power));
             let pts: Vec<(f64, f64)> = points.iter().map(|p| (p.1, p.2)).collect();
-            if !keep_going(&pts, max_loss, KNEE_ELASTICITY) {
+            if let Some((_, why)) = power_stop(&pts, max_loss, KNEE_ELASTICITY) {
+                let loss = (1.0 - perf / p0) * 100.0;
+                ended = match why {
+                    PowerStop::LossCap => format!(
+                        "{w:.0} W would cost {loss:.1}% performance, more than the {:.0}% this profile allows",
+                        max_loss * 100.0
+                    ),
+                    PowerStop::Knee => format!(
+                        "below it every watt costs clearly more performance ({w:.0} W: {loss:.1}% slower)"
+                    ),
+                };
                 break;
             }
             w -= 10.0;
@@ -1540,6 +1714,7 @@ impl<'a> Tuner<'a> {
                     power_limit_mw: Some(mw),
                     perf,
                     heavy_power: power,
+                    power_note: Some(format!("stopped here because {ended}")),
                     ..prof
                 })
             }
@@ -1549,7 +1724,13 @@ impl<'a> Tuner<'a> {
                     &format!("{label}: a lower power limit doesn't pay off, keeping the default"),
                     Tone::Normal,
                 );
-                Ok(prof)
+                Ok(Prof {
+                    power_note: Some(format!(
+                        "default kept: a lower limit doesn't save at least {:.0}% power within the allowed loss ({ended})",
+                        min_save * 100.0
+                    )),
+                    ..prof
+                })
             }
         }
     }
@@ -1775,9 +1956,9 @@ pub fn est_pass1(p: &PassArgs) -> f64 {
     } as f64;
     // baseline (2 full, ~3 calibration + 2 game-like), calibration, memory, 6 search steps per
     // clock (game-like + half as long full load each), measurement
-    let tests = 9.0 + 2.0 + steps + 3.0 + n * 14.0;
+    let tests = 11.0 + 2.0 + steps + 3.0 + n * 14.0;
     p.warm
-        + 5.0 * p.measure
+        + 7.0 * p.measure
         + 3.0 * 8.0
         + 31.0
         + steps * p.mem_seconds
@@ -1788,9 +1969,9 @@ pub fn est_pass1(p: &PassArgs) -> f64 {
 
 pub fn est_pass2(p: &PassArgs, n_clocks: usize) -> f64 {
     let n = n_clocks as f64;
-    let tests = 6.0 + 5.0 + n * 10.0;
+    let tests = 8.0 + 5.0 + n * 10.0;
     p.warm
-        + 5.0 * p.measure
+        + 7.0 * p.measure
         + 8.0
         + 5.0 * (p.combo_seconds + p.combo_warmup)
         + n * (4.0 * 1.5 * p.search_seconds + 2.0 * p.measure + p.warmup)
@@ -1815,9 +1996,26 @@ mod tests {
 
     #[test]
     fn mem_rule() {
-        assert!(mem_step_worth_it(12126.0, 676.0, 12001.0, 669.0, 0.001));
-        assert!(!mem_step_worth_it(12126.0, 670.0, 12001.0, 669.0, 0.001));
-        assert!(!mem_step_worth_it(12126.0, 676.0, 12001.0, 669.0, 0.01));
+        // the user's RTX 4080 Super, pass 2 with a hot GPU: bandwidth follows the clock all the
+        // way (no retries); each 250 step adds ~1.1%, less than the 1.56% noise threshold, but
+        // the range as a whole clearly gains
+        let hot = [
+            (2500, 674.5, 12751.0),
+            (2750, 681.9, 12876.0),
+            (3000, 688.6, 13001.0),
+            (3250, 695.6, 13126.0),
+        ];
+        assert_eq!(pick_mem(&hot, 0.0078), (3, MemStop::Top));
+        // bandwidth flattens from +3000 on: retries
+        let retries = [
+            (2500, 674.5, 12751.0),
+            (2750, 681.9, 12876.0),
+            (3000, 682.5, 13001.0),
+            (3250, 683.0, 13126.0),
+        ];
+        assert_eq!(pick_mem(&retries, 0.003), (1, MemStop::Retries(3000)));
+        // a small gain lost in the noise: keep the lowest
+        assert_eq!(pick_mem(&hot[..2], 0.02), (0, MemStop::NoGain));
     }
 
     #[test]
@@ -1891,8 +2089,11 @@ mod tests {
         );
         // 3% cap: 270 W costs 3.1%, so 280 W (2.1%) is the lowest allowed
         assert_eq!(pick_knee(&pts, 0.03, 0.03, KNEE_ELASTICITY), Some(2));
-        assert!(!keep_going(&pts[..4], 0.03, KNEE_ELASTICITY));
-        assert!(keep_going(&pts[..3], 0.03, KNEE_ELASTICITY));
+        assert_eq!(
+            power_stop(&pts[..4], 0.03, KNEE_ELASTICITY),
+            Some((3, PowerStop::LossCap))
+        );
+        assert_eq!(power_stop(&pts[..3], 0.03, KNEE_ELASTICITY), None);
     }
 
     #[test]
@@ -1909,6 +2110,57 @@ mod tests {
         assert_eq!(pick_knee(&pts, 0.03, 0.03, KNEE_ELASTICITY), Some(5)); // 250 W: -2.8%
         // saving only ~2% isn't worth a lower limit
         assert_eq!(pick_knee(&pts[..4], 0.03, 0.03, KNEE_ELASTICITY), None);
+    }
+
+    #[test]
+    fn floor_offset_finds_where_power_stops_falling() {
+        // the user's card, pass 1, game-like power per stable offset
+        let at_2400 = [
+            (0, 107.1),
+            (225, 101.0),
+            (345, 100.7),
+            (405, 100.2),
+            (435, 100.1),
+            (450, 99.8),
+        ];
+        assert_eq!(floor_offset(&at_2400, 0.0174), Some(225));
+        let at_2550 = [(0, 118.2), (225, 101.3), (330, 100.3), (345, 100.6)];
+        assert_eq!(floor_offset(&at_2550, 0.0174), Some(225));
+        // still falling at 2700 and 2850: no flat part confirmed by two higher offsets
+        let at_2700 = [
+            (0, 140.6),
+            (165, 117.6),
+            (240, 115.0),
+            (255, 112.0),
+            (270, 108.3),
+            (285, 110.2),
+        ];
+        assert_eq!(floor_offset(&at_2700, 0.0174), None);
+        let at_2850 = [
+            (0, 147.5),
+            (135, 147.9),
+            (210, 132.9),
+            (240, 127.6),
+            (255, 127.3),
+            (270, 124.4),
+        ];
+        assert_eq!(floor_offset(&at_2850, 0.0174), None);
+        assert_eq!(floor_offset(&at_2850[..2], 0.0174), None);
+        // overclock region (cap above the stock boost): power rises with the offset
+        let oc = [
+            (0, 200.0),
+            (30, 202.0),
+            (60, 204.4),
+            (90, 206.5),
+            (105, 207.6),
+        ];
+        assert_eq!(floor_offset(&oc, 0.015), None);
+    }
+
+    #[test]
+    fn spread_of_three_runs() {
+        assert!((spread(&[490.775, 494.398, 498.8]) - 0.0162).abs() < 0.0002);
+        assert_eq!(spread(&[5.0, 5.0, 5.0]), 0.0);
     }
 
     #[test]

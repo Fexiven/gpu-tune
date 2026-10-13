@@ -1,6 +1,6 @@
 [package]
 name = "gpu-tune"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "Automatic overclock / undervolt finder for NVIDIA GPUs on Linux, tested with Vulkan loads like games"
 license = "MIT"
