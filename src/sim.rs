@@ -26,6 +26,8 @@ struct Card {
     paced_scale: f64,
     /// full load: most power the shader can draw however heavy it gets
     heavy_max_w: f64,
+    /// below this power the voltage is at its floor: every watt saved costs ~1:1 performance
+    vmin_w: f64,
 }
 
 impl Default for Card {
@@ -42,6 +44,7 @@ impl Default for Card {
             stock_boost: 2800.0,
             paced_scale: 1.0,
             heavy_max_w: 400.0,
+            vmin_w: 0.0,
         }
     }
 }
@@ -75,6 +78,7 @@ impl FakeGpu {
                 mem_range: (-2000, 6000),
                 api: "per P-state (P0)".into(),
                 max_mem_clk: 11501,
+                max_core_clk: 3105,
             },
             s: Mutex::new(Settings {
                 power_mw: 320_000,
@@ -240,11 +244,16 @@ impl Runner for FakeRunner {
                     let natural = want * volt.min(1.0).powi(2);
                     // the power limit holds the card below its natural draw, costing some speed
                     let cap = s.power_mw as f64 / 1000.0 - 2.0;
-                    let (power, slow) = if natural >= cap {
+                    let (power, mut slow) = if natural >= cap {
                         (cap, (cap / natural).powf(0.25))
                     } else {
                         (natural, 1.0)
                     };
+                    // below the voltage floor only the clock can drop: ~1:1 performance per watt
+                    let floor = c.vmin_w - 2.0;
+                    if power < floor {
+                        slow *= power / floor;
+                    }
                     summ.power = self.noise(power, 0.002);
                     if natural >= cap {
                         summ.limit = "power".into();
@@ -310,7 +319,7 @@ fn args(gpu: &FakeGpu) -> PassArgs {
         combo_warmup: 10.0,
         mem_step: 500,
         soak: 120.0,
-        clocks: vec![2490, 2640, 2790, 2940],
+        clocks: vec![], // auto, from the stock boost clock
         hints: Default::default(),
         refine_mem: None,
         refine_mem_top: false,
@@ -485,10 +494,11 @@ fn finds_the_built_in_limits() {
         assert!(p.core <= 200, "{n} must pass the idle check: {p:?}");
     }
     assert!(pr("efficient").paced_power <= pr("balanced").paced_power + 1.0);
-    // power search: efficient (3% allowed) gets a lower limit, balanced (1%) keeps the default
+    // power search: no voltage floor on this card, so efficient goes down in 10 W steps until
+    // the 3% loss cap; balanced (1%) keeps the default
     assert_eq!(
         pr("efficient").power_limit_mw,
-        Some(256_000),
+        Some(250_000),
         "{:?}",
         pr("efficient")
     );
@@ -506,6 +516,43 @@ fn finds_the_built_in_limits() {
         "{} min",
         r.sim_minutes
     );
+}
+
+#[test]
+fn power_search_stops_at_the_knee() {
+    // voltage floor at 255 W: above it a lower limit mostly lowers the voltage (cheap), below it
+    // only the clock can drop (every watt costs performance). Without it: 250 W (see above).
+    let r = run(Card {
+        vmin_w: 255.0,
+        ..Default::default()
+    });
+    assert_eq!(r.res, Ok(()), "{:?}", r.events);
+    let eff = &r.state.result.as_ref().unwrap().profiles["efficient"];
+    assert_eq!(eff.power_limit_mw, Some(260_000), "{eff:?}");
+    // it looked one step past the knee, then stopped
+    assert!(
+        r.events
+            .iter()
+            .any(|e| e.contains("Efficient: 250 W limit"))
+    );
+    assert!(
+        !r.events
+            .iter()
+            .any(|e| e.contains("Efficient: 240 W limit"))
+    );
+}
+
+#[test]
+fn clock_scan_follows_the_cards_stock_boost() {
+    let keys = |r: &Run| r.state.p1.clocks.keys().copied().collect::<Vec<_>>();
+    let r = run(Card::default());
+    assert_eq!(keys(&r), vec![2490, 2640, 2790, 2940]);
+    let r = run(Card {
+        stock_boost: 2560.0,
+        ..Default::default()
+    });
+    assert_eq!(r.res, Ok(()), "{:?}", r.events);
+    assert_eq!(keys(&r), vec![2250, 2400, 2550, 2700]);
 }
 
 #[test]

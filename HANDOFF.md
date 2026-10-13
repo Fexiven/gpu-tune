@@ -50,6 +50,14 @@ The two must always be used together (README explains this to users).
 9. v0.4-0.5: three profiles, each soak-tested; per-profile power-limit search (efficient ≤3% loss,
    balanced ≤1%); performance checks the max power limit; sleep inhibitor (systemd-inhibit).
    Decided NOT to run every test at several power limits (see README "How it works" step 6).
+10. v0.6: power search walks down in 10 W steps from the profile's measured draw and stops at
+    the knee (`pick_knee` in `tuner.rs`: step elasticity perf-loss/power-save > 0.6, steps
+    saving < 0.5% ignored, total loss capped, total save ≥ max(3%, 3× noise)). The offset stays
+    fixed while the limit changes (asked by the user; answer in README step 6). Pass 1's clock
+    caps now default to the card's stock boost −300/−150/0/+150 (`auto_clocks`), capped at
+    NVML's max graphics clock (`GpuInfo::max_core_clk`); `--clocks` still overrides. GitHub
+    Actions CI added (`.github/workflows/ci.yml`: fmt, clippy, tests, nix build).
+    Repo: https://github.com/Fexiven/gpu-tune. Commit as the user (Fexiven), not as the AI.
 
 ## 4. Architecture (src/)
 
@@ -90,12 +98,12 @@ Key mechanisms worth knowing before changing anything:
 
 | what | how verified |
 |---|---|
-| whole tuning flow, crashes, reboots, Ctrl+C, overheat, three profiles, power search, calibrations, estimates | `cargo test`: 27 tests incl. simulated card (`sim.rs`) |
+| whole tuning flow, crashes, reboots, Ctrl+C, overheat, three profiles, power search, calibrations, estimates | `cargo test`: 33 tests incl. simulated card (`sim.rs`) |
 | Vulkan loads run, are deterministic, detect injected errors | lavapipe in the dev container: `gpu-tune --self-test --vulkan-device any --width 320 --height 192 --mem-mb 64`; user's 4080 SUPER: `--self-test` all ok, P0 |
 | VRAM temperature via NvAPI | user's card: `--check-vram` ok |
-| NixOS flake builds and runs | user's machine (v0.2); dev container can only `nix eval` (binary cache blocked) |
+| NixOS flake builds and runs | user's machine (v0.2); CI builds it on every push (`nix build`) |
 | NVML control, full tuning run | user's card, **v0.2 only** (results §6) |
-| **not yet verified on hardware** | v0.3+ load calibration (does heavy reach 320 W? how big does `alu` get?), paced sizing, full load in search steps, three profiles, power search, sleep inhibitor, dashboard after v0.2 |
+| **not yet verified on hardware** | v0.3+ load calibration (does heavy reach 320 W? how big does `alu` get?), paced sizing, full load in search steps, three profiles, power knee search (real knee position on a 4080 Super?), auto clock range, sleep inhibitor, dashboard after v0.2 |
 
 First thing to do with new hardware results: read the CSV log (`gpu_tune_log_*.csv`). Check
 `limited_by=power` on stock heavy rows, `busy` ≈ 0.45-0.75 on paced rows with `missed` ≈ 0,
@@ -118,7 +126,7 @@ First thing to do with new hardware results: read the CSV log (`gpu_tune_log_*.c
 
 ## 7. Open work / ideas (rough priority)
 
-1. **Get a v0.5 run log from the user** and check §5's list. Likely tuning needed: `alu` range,
+1. **Get a v0.6 run log from the user** and check §5's list. Likely tuning needed: `alu` range,
    paced sizing, time estimates on real hardware.
 2. **V/F curve editing via NvAPI** (LACT has it: `QUERY_NVAPI_GPU_CLOCK_CLIENT_CLK_VF_POINTS_*` in
    LACT's `nvapi.rs`). A real undervolt curve would leave the low idle points untouched instead
@@ -136,7 +144,7 @@ First thing to do with new hardware results: read the CSV log (`gpu_tune_log_*.c
 
 ## 8. Development
 
-- Rust ≥ 1.88 (ratatui MSRV), edition 2024. wgpu **30** (API differs from older versions:
+- Rust ≥ 1.90 (wgpu 30 needs ordered-float 5, MSRV 1.90; CI builds with 1.90), edition 2024. wgpu **30** (API differs from older versions:
   `PollType::Wait{submission_index,timeout}`, `enumerate_adapters` is async, adapter info has
   `device_pci_bus_id`, pipeline layouts take `&[Option<&BindGroupLayout>]`).
 - `serde_json` needs `float_roundtrip` (state files must round-trip floats exactly; a test caught it).

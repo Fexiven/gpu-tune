@@ -75,8 +75,9 @@ struct Cli {
     /// which NVIDIA GPU (NVML index)
     #[arg(long, default_value_t = 0)]
     gpu: u32,
-    /// max clocks scanned in pass 1 (MHz)
-    #[arg(long, num_args = 1.., default_values_t = [2490u32, 2640, 2790, 2940])]
+    /// max clocks scanned in pass 1 (MHz) [default: 4 caps around the card's stock boost clock,
+    /// from 300 MHz below to 150 MHz above]
+    #[arg(long, num_args = 1..)]
     clocks: Vec<u32>,
     #[arg(long, default_value_t = 450)]
     core_max: i32,
@@ -415,6 +416,7 @@ fn main() {
                 mem_range: hw::HARD_MEM,
                 api: "none".into(),
                 max_mem_clk: 0,
+                max_core_clk: 0,
             };
             let gpu: Arc<dyn Gpu> = Arc::new(hw::NullGpu(info));
             let runner = ProcessRunner { gpu: gpu.clone() };

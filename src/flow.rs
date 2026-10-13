@@ -3,7 +3,9 @@
 use crate::hw::Gpu;
 use crate::runner::{Clock, R, Runner};
 use crate::state::{Baseline, Pass, PassState, Prof, ResultRec, Saver, profile_label};
-use crate::tuner::{PassArgs, Profiles, Tuner, game_rel, interpolate_hints, select_profiles};
+use crate::tuner::{
+    PassArgs, Profiles, Tuner, auto_clocks, game_rel, interpolate_hints, select_profiles,
+};
 use crate::ui::{Finding, Log, RowState, Tone, Ui};
 use std::collections::BTreeMap;
 
@@ -83,6 +85,22 @@ pub fn tune(e: &Env, base_args: &PassArgs, goal: &str, quick_only: bool, single:
     );
     let r1 = (|| -> R<_> {
         let b1 = t1.baseline()?;
+        if t1.a.clocks.is_empty() {
+            t1.a.clocks = auto_clocks(b1.paced_clk, e.gpu.info().max_core_clk);
+            e.ui.event(
+                "•",
+                &format!(
+                    "stock boost {:.0} MHz: scanning clock caps {}",
+                    b1.paced_clk,
+                    t1.a.clocks
+                        .iter()
+                        .map(|c| c.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Tone::Normal,
+            );
+        }
         t1.calibrate()?;
         let m1 = t1.memory()?;
         t1.core(m1)?;

@@ -48,6 +48,8 @@ pub struct GpuInfo {
     pub api: String,
     /// stock maximum memory clock (what games get), MHz as nvidia-smi shows it
     pub max_mem_clk: u32,
+    /// highest GPU clock the driver allows (MHz, 0 = unknown); caps the clock scan
+    pub max_core_clk: u32,
 }
 
 pub trait Gpu: Send + Sync {
@@ -118,6 +120,7 @@ impl RealGpu {
                 "legacy (all P-states)".into()
             },
             max_mem_clk: 0,
+            max_core_clk: 0,
         };
         let gpu = RealGpu {
             vram: VramSensor::new(&bus, dev_id),
@@ -129,6 +132,7 @@ impl RealGpu {
         };
         gpu.reset(); // start from real stock, even if LACT applied something before
         info.max_mem_clk = gpu.nvml.max_clock(h, nvml::CLOCK_MEM)?;
+        info.max_core_clk = gpu.nvml.max_clock(h, nvml::CLOCK_GRAPHICS).unwrap_or(0);
         Ok(RealGpu { info, ..gpu })
     }
 

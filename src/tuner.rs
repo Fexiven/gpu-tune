@@ -103,6 +103,57 @@ pub fn prof_power(p: &Prof, info: &crate::hw::GpuInfo) -> u32 {
     }
 }
 
+/// A power step is worth it while the performance it costs is at most this fraction of the power
+/// it saves (relative). Near the top of the curve a GPU loses ~0.3% performance per 1% power
+/// (voltage drops along with the clock); once the voltage is at its floor it's ~1:1.
+pub const KNEE_ELASTICITY: f64 = 0.6;
+
+/// Changes in power below this (relative) mean the limit didn't bite: ignore the step.
+const MIN_STEP_SAVE: f64 = 0.005;
+
+/// `points[0]` = (performance, power) at the default limit, then lower limits in order.
+/// True while the latest step still looks worth it, i.e. the search should continue.
+pub fn keep_going(points: &[(f64, f64)], max_loss: f64, max_elast: f64) -> bool {
+    pick_steps(points, max_loss, max_elast).1
+}
+
+/// The sweet spot among `points` (see `keep_going`): the lowest limit reached while every step
+/// cost at most `max_elast` x the power it saved and the total loss stayed within `max_loss`.
+/// None if it doesn't save at least `min_save` power.
+pub fn pick_knee(
+    points: &[(f64, f64)],
+    max_loss: f64,
+    min_save: f64,
+    max_elast: f64,
+) -> Option<usize> {
+    let (best, _) = pick_steps(points, max_loss, max_elast);
+    let (_, w0) = *points.first()?;
+    best.filter(|&i| 1.0 - points[i].1 / w0 >= min_save)
+}
+
+fn pick_steps(points: &[(f64, f64)], max_loss: f64, max_elast: f64) -> (Option<usize>, bool) {
+    let Some(&(p0, w0)) = points.first() else {
+        return (None, false);
+    };
+    let (mut best, mut last_loss, mut last_save) = (None, 0.0, 0.0);
+    for (i, &(perf, power)) in points.iter().enumerate().skip(1) {
+        let (loss, save) = (1.0 - perf / p0, 1.0 - power / w0);
+        if loss > max_loss {
+            return (best, false);
+        }
+        let ds = save - last_save;
+        if ds < MIN_STEP_SAVE {
+            continue; // the limit didn't bite (yet): nothing to judge
+        }
+        if (loss - last_loss) / ds > max_elast {
+            return (best, false); // the knee: from here on power is bought with performance
+        }
+        (last_loss, last_save) = (loss, save);
+        best = Some(i);
+    }
+    (best, true)
+}
+
 pub fn rel_noise(a: f64, b: f64) -> f64 {
     let m = (a.abs() + b.abs()) / 2.0;
     if m > 0.0 { (a - b).abs() / m } else { 0.0 }
@@ -257,6 +308,29 @@ pub fn select_profiles(found: &[Prof], base: &Baseline) -> Profiles {
         balanced: bal,
         max: fast,
     }
+}
+
+/// Pass 1's clock caps relative to the card's stock boost clock (game-like load at stock):
+/// from a deep undervolt to a little overclock.
+pub const AUTO_CLOCKS: [i64; 4] = [-300, -150, 0, 150];
+
+/// The clock caps to scan when `--clocks` isn't given: around the stock boost clock, in 15 MHz
+/// steps (the V/F curve's resolution), never above the driver's maximum.
+pub fn auto_clocks(stock_clk: f64, max_clk: u32) -> Vec<u32> {
+    let base = (stock_clk as i64) / 15 * 15;
+    let top = if max_clk > 0 {
+        (max_clk / 15 * 15) as i64
+    } else {
+        i64::MAX
+    };
+    let mut v: Vec<u32> = AUTO_CLOCKS
+        .iter()
+        .map(|d| (base + d).min(top))
+        .filter(|c| *c >= 1500)
+        .map(|c| c as u32)
+        .collect();
+    v.dedup();
+    v
 }
 
 pub fn interpolate_hints(found: &[Prof], clocks: &[u32]) -> BTreeMap<u32, i32> {
@@ -1367,97 +1441,109 @@ impl<'a> Tuner<'a> {
         }
     }
 
-    /// Looks for a lower power limit for a profile: full load with its settings at 100/90/80/70%
-    /// of the default limit. Keeps the lowest limit that costs at most `max_loss` full-load
-    /// performance and saves clearly more power than the measurement noise. Stops at the first
-    /// limit that is unstable: under a power limit the card runs lower points of the shifted
-    /// voltage/frequency curve, which the soak test at the chosen limit then confirms.
+    /// Looks for the power-limit sweet spot of a profile. Full load with its settings, first at
+    /// the default limit, then in 10 W steps down from what it actually draws. It keeps going
+    /// while each step saves clearly more power than it costs performance and stops at the knee:
+    /// where the card has run out of voltage to drop and only loses clock speed. `max_loss` caps
+    /// the total full-load performance loss. Stops above the first unstable limit: under a power
+    /// limit the card runs lower points of the shifted voltage/frequency curve, which the soak
+    /// test at the chosen limit then confirms.
     pub fn power_search(&mut self, name: &str, prof: Prof, max_loss: f64) -> R<Prof> {
         let info = self.gpu.info().clone();
         let label = crate::state::profile_label(name);
-        let (measure, warmup) = (self.a.measure, self.a.warmup);
+        let secs = (self.a.measure * 0.5).max(10.0);
         let noise = self
             .st
             .baseline
             .as_ref()
             .map(|b| b.noise.clone())
             .unwrap_or_default();
+        let min_save = 0.03f64.max(3.0 * noise.heavy_power);
         self.ui.set_phase(
-            &format!("{label}: looking for a lower power limit"),
-            "Full load at 100, 90, 80 and 70% of the power limit. A lower limit is kept if it saves clearly more \
-             power than it costs performance.",
+            &format!("{label}: looking for the power-limit sweet spot"),
+            "Full load in 10 W steps down from what these settings draw. Stops where saving more power \
+             starts to cost clearly more performance.",
         );
-        let mut base: Option<(f64, f64)> = None;
-        let mut best: Option<(u32, u32, f64, f64)> = None;
-        for pct in [100u32, 90, 80, 70] {
-            let pl = (info.default_pl as u64 * pct as u64 / 100) as u32;
-            if pl < info.min_pl {
-                break;
-            }
+        let key = |w: u32| format!("pl:{}:{}:{}:{w}", prof.max_clock, prof.core, prof.mem);
+        let run = |t: &mut Self, mw: u32, warm: f64| -> R<Option<(f64, f64)>> {
             let s = Settings {
                 core: prof.core,
                 mem: prof.mem,
                 clock: Some(prof.max_clock),
-                power_mw: pl,
+                power_mw: mw,
             };
-            let v = self.probe(
-                &format!("pl:{}:{}:{}:{pct}", prof.max_clock, prof.core, prof.mem),
-                |t| {
-                    let (ok, r) = t.test(Kind::Heavy, s, measure, warmup, None, false)?;
-                    Ok(r.filter(|_| ok).map_or(
-                        Value::Bool(false),
-                        |r| json!({"perf": r.perf, "power": r.avg_power}),
-                    ))
-                },
-            )?;
-            let (Some(perf), Some(power)) = (v["perf"].as_f64(), v["power"].as_f64()) else {
+            let v = t.probe(&key(mw / 1000), |t| {
+                let (ok, r) = t.test(Kind::Heavy, s, secs, warm, None, false)?;
+                Ok(r.filter(|_| ok).map_or(
+                    Value::Bool(false),
+                    |r| json!({"perf": r.perf, "power": r.avg_power}),
+                ))
+            })?;
+            Ok(v["perf"].as_f64().zip(v["power"].as_f64()))
+        };
+        // reference: the default limit
+        let Some((p0, w0)) = run(self, info.default_pl, self.a.warmup)? else {
+            self.ui.event(
+                "•",
+                &format!("{label}: full load failed at the default limit, keeping it"),
+                Tone::Warn,
+            );
+            return Ok(prof);
+        };
+        let floor_w = (info.default_pl as f64 * 0.7).max(info.min_pl as f64) / 1000.0;
+        // first limit that actually binds: the next 10 W step below the measured draw
+        let mut w = ((w0 - 2.0) / 10.0).floor() * 10.0;
+        let mut points: Vec<(u32, f64, f64)> = vec![(info.default_pl, p0, w0)];
+        while w >= floor_w {
+            let mw = (w * 1000.0) as u32;
+            let Some((perf, power)) = run(self, mw, 5.0)? else {
                 self.ui.event(
                     "•",
-                    &format!("{label}: {pct}% power limit is unstable with these settings"),
+                    &format!(
+                        "{label}: {w:.0} W is unstable with these settings, stopping above it"
+                    ),
                     Tone::Warn,
                 );
                 break;
             };
-            let Some((p0, w0)) = base else {
-                base = Some((perf, power));
-                continue;
-            };
-            let (loss, save) = (1.0 - perf / p0, 1.0 - power / w0);
-            if loss > max_loss {
-                self.ui.event(
-                    "•",
-                    &format!(
-                        "{label}: {pct}% power limit costs {:.1}% performance, too much",
-                        loss * 100.0
-                    ),
-                    Tone::Normal,
-                );
+            self.ui.event(
+                "•",
+                &format!(
+                    "{label}: {w:.0} W limit: {:+.1}% performance, {:+.1}% power",
+                    (perf / p0 - 1.0) * 100.0,
+                    (power / w0 - 1.0) * 100.0
+                ),
+                Tone::Normal,
+            );
+            points.push((mw, perf, power));
+            let pts: Vec<(f64, f64)> = points.iter().map(|p| (p.1, p.2)).collect();
+            if !keep_going(&pts, max_loss, KNEE_ELASTICITY) {
                 break;
             }
-            if save > 0.03f64.max(3.0 * noise.heavy_power) {
-                best = Some((pct, pl, perf, power));
-            }
+            w -= 10.0;
         }
-        match (best, base) {
-            (Some((pct, pl, perf, power)), Some((p0, w0))) => {
+        let pts: Vec<(f64, f64)> = points.iter().map(|p| (p.1, p.2)).collect();
+        match pick_knee(&pts, max_loss, min_save, KNEE_ELASTICITY) {
+            Some(i) => {
+                let (mw, perf, power) = points[i];
                 self.ui.event(
                     "★",
                     &format!(
-                        "{label}: power limit {:.0} W ({pct}%) saves {:.0}% power at full load for {:.1}% performance",
-                        pl as f64 / 1000.0,
+                        "{label}: power limit {:.0} W saves {:.0}% power at full load for {:.1}% performance",
+                        mw as f64 / 1000.0,
                         (1.0 - power / w0) * 100.0,
                         (1.0 - perf / p0) * 100.0
                     ),
                     Tone::Star,
                 );
                 Ok(Prof {
-                    power_limit_mw: Some(pl),
+                    power_limit_mw: Some(mw),
                     perf,
                     heavy_power: power,
                     ..prof
                 })
             }
-            _ => {
+            None => {
                 self.ui.event(
                     "•",
                     &format!("{label}: a lower power limit doesn't pay off, keeping the default"),
@@ -1682,7 +1768,11 @@ const TEST_OVERHEAD: f64 = 5.0;
 
 pub fn est_pass1(p: &PassArgs) -> f64 {
     let steps = (p.mem_max / p.mem_step + 2) as f64;
-    let n = p.clocks.len() as f64;
+    let n = if p.clocks.is_empty() {
+        AUTO_CLOCKS.len()
+    } else {
+        p.clocks.len()
+    } as f64;
     // baseline (2 full, ~3 calibration + 2 game-like), calibration, memory, 6 search steps per
     // clock (game-like + half as long full load each), measurement
     let tests = 9.0 + 2.0 + steps + 3.0 + n * 14.0;
@@ -1707,9 +1797,12 @@ pub fn est_pass2(p: &PassArgs, n_clocks: usize) -> f64 {
         + tests * TEST_OVERHEAD
 }
 
-/// power-limit search for one profile: four full-load tests
+/// power-limit search for one profile: reference + ~7 short full-load steps
 pub fn est_power(p: &PassArgs) -> f64 {
-    4.0 * (p.measure + p.warmup + TEST_OVERHEAD)
+    (p.measure * 0.5).max(10.0)
+        + p.warmup
+        + 7.0 * ((p.measure * 0.5).max(10.0) + 5.0)
+        + 8.0 * TEST_OVERHEAD
 }
 
 pub fn est_soak(p: &PassArgs) -> f64 {
@@ -1772,6 +1865,61 @@ mod tests {
         )
         .unwrap();
         assert!(!calls.contains(&240), "{calls:?}");
+    }
+
+    /// (performance, power) for a card drawing `natural` W: perf ~ (limit/natural)^0.3 while the
+    /// voltage can still drop, ~ linear in power below `vmin` W.
+    fn curve(natural: f64, vmin: f64, limits: &[f64]) -> Vec<(f64, f64)> {
+        let mut v = vec![(100.0, natural)];
+        for &l in limits {
+            let w = l.min(natural);
+            let mut perf = 100.0 * (w / natural).powf(0.3);
+            if w < vmin {
+                perf *= w / vmin;
+            }
+            v.push((perf, w));
+        }
+        v
+    }
+
+    #[test]
+    fn knee_without_a_knee_stops_at_the_loss_cap() {
+        let pts = curve(
+            300.0,
+            0.0,
+            &[290.0, 280.0, 270.0, 260.0, 250.0, 240.0, 230.0],
+        );
+        // 3% cap: 270 W costs 3.1%, so 280 W (2.1%) is the lowest allowed
+        assert_eq!(pick_knee(&pts, 0.03, 0.03, KNEE_ELASTICITY), Some(2));
+        assert!(!keep_going(&pts[..4], 0.03, KNEE_ELASTICITY));
+        assert!(keep_going(&pts[..3], 0.03, KNEE_ELASTICITY));
+    }
+
+    #[test]
+    fn knee_stops_where_power_starts_costing_performance() {
+        // voltage floor at 270 W: below that every watt costs ~1:1
+        let pts = curve(300.0, 270.0, &[290.0, 280.0, 270.0, 260.0, 250.0]);
+        assert_eq!(pick_knee(&pts, 0.10, 0.03, KNEE_ELASTICITY), Some(3)); // 270 W
+    }
+
+    #[test]
+    fn knee_ignores_limits_that_dont_bite_and_needs_real_savings() {
+        // the card only draws 275 W: 290 and 280 W limits change nothing
+        let pts = curve(275.0, 0.0, &[290.0, 280.0, 270.0, 260.0, 250.0]);
+        assert_eq!(pick_knee(&pts, 0.03, 0.03, KNEE_ELASTICITY), Some(5)); // 250 W: -2.8%
+        // saving only ~2% isn't worth a lower limit
+        assert_eq!(pick_knee(&pts[..4], 0.03, 0.03, KNEE_ELASTICITY), None);
+    }
+
+    #[test]
+    fn auto_clocks_follow_the_stock_boost() {
+        // RTX 4080 Super: ~2800 MHz stock boost -> the old default list
+        assert_eq!(auto_clocks(2800.0, 3105), vec![2490, 2640, 2790, 2940]);
+        // a lower-clocked card scans lower
+        assert_eq!(auto_clocks(2520.0, 0), vec![2220, 2370, 2520, 2670]);
+        // never above the driver's maximum (and no duplicates)
+        assert_eq!(auto_clocks(2900.0, 2950), vec![2595, 2745, 2895, 2940]);
+        assert_eq!(auto_clocks(2900.0, 2900), vec![2595, 2745, 2895]);
     }
 
     #[test]

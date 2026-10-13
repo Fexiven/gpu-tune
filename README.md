@@ -9,7 +9,7 @@ clock cap and memory offset, and tells you what to enter in
 Made for the RTX 4080 Super; works on RTX 30/40/50 cards with the proprietary driver (555+ recommended).
 
 ```
-nix run github:<you>/gpu-tune          # NixOS / Nix
+nix run github:Fexiven/gpu-tune         # NixOS / Nix
 # or
 cargo build --release && ./target/release/gpu-tune
 ```
@@ -80,17 +80,23 @@ pattern and checks every word. Each test runs in its own process, so a crash onl
 3. Memory: the bandwidth peak. Too much memory clock causes transfer retries (GDDR6X error
    detection and replay), which show up as lost bandwidth. The best steps are re-checked with a
    hot GPU, and a step only counts if it clearly adds bandwidth.
-4. Core: for several clock caps, a binary search for the highest stable offset. Each step runs
+4. Core: for four clock caps around your card's stock boost clock (300 MHz below to 150 MHz
+   above, never above the driver's maximum; or your own list with `--clocks`), a binary search for the highest stable offset. Each step runs
    the game-like load (bursts at 120 fps, load changing every frame) and then the full load at
    the power limit. A higher offset at the same clock cap means lower voltage, so less power. The
    result is used with a 45 MHz safety margin (longer tests find lower limits).
 5. Pass 2 repeats steps 3-4 around each profile's area with full-length tests and finer steps.
-6. Power limit (efficient and balanced profiles): full load with the profile's settings at
-   100/90/80/70% of the default power limit. The lowest limit that costs at most 3% (efficient)
-   or 1% (balanced) full-load performance and saves clearly more power than the noise is kept.
+6. Power limit (efficient and balanced profiles): full load with the profile's settings, first
+   at the default limit, then in 10 W steps down from what it actually draws. At first a lower
+   limit mostly lowers the voltage, which costs little performance; at some point the card has
+   no voltage left to drop and only loses clock speed, so every watt saved costs performance.
+   The search stops at that knee (a step that costs more than 0.6% performance per 1% power),
+   or when the total loss passes 3% (efficient) or 1% (balanced). The last limit before it is
+   kept if it saves clearly more power than the noise (at least 3%).
    The performance profile instead checks whether the card's maximum limit adds performance.
-   (Running every test at several limits wouldn't find a better result: stability is decided at
-   the highest current, and the limit only matters when the card is power-limited.)
+   (The offset stays the same while the limit changes: stability is decided at the highest
+   current, at the clock cap, and a lower limit only moves the card down the same curve. The
+   soak test at the chosen limit confirms it.)
 7. Soak test of each profile, at its power limit: cold start, full load, game-like load, memory with a hot GPU, and
    **desktop idle with sudden load**. An offset shifts the whole voltage/frequency curve,
    including the low idle points, which is where Linux undervolts often crash.
@@ -142,7 +148,7 @@ Written to the current directory (or `--dir`), owned by your user:
 
 ## Building
 
-Needs Rust 1.88+, the NVIDIA proprietary driver and the Vulkan loader (`libvulkan.so.1`).
+Needs Rust 1.90+, the NVIDIA proprietary driver and the Vulkan loader (`libvulkan.so.1`).
 
 ```
 cargo build --release
