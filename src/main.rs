@@ -144,6 +144,57 @@ fn ensure_root() {
 }
 
 /// Resets the GPU to stock however the program ends (error, panic, Ctrl+C).
+/// Blocks suspend and idle actions while the tuner runs (systemd-logind inhibitor). The lock is
+/// held by `systemd-inhibit` running a helper that exits as soon as this process does, so even a
+/// hard kill can't leave the system unable to sleep.
+struct SleepGuard(Option<std::process::Child>);
+
+impl SleepGuard {
+    fn start() -> Result<Self, String> {
+        let pid = std::process::id().to_string();
+        let tool = [
+            "systemd-inhibit",
+            "/run/current-system/sw/bin/systemd-inhibit",
+            "/usr/bin/systemd-inhibit",
+            "/bin/systemd-inhibit",
+        ]
+        .into_iter()
+        .find(|t| !t.starts_with('/') || std::path::Path::new(t).exists())
+        .unwrap_or("systemd-inhibit");
+        let mut child = std::process::Command::new(tool)
+            .args([
+                "--what=sleep:idle",
+                "--who=gpu-tune",
+                "--why=GPU tuning in progress",
+                "--mode=block",
+            ])
+            .args(["tail", "--pid", &pid, "-f", "/dev/null"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("systemd-inhibit not available ({e})"))?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if let Ok(Some(st)) = child.try_wait() {
+            let mut err = String::new();
+            if let Some(mut e) = child.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut e, &mut err);
+            }
+            return Err(format!("systemd-inhibit exited ({st}): {}", err.trim()));
+        }
+        Ok(SleepGuard(Some(child)))
+    }
+}
+
+impl Drop for SleepGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
 struct ResetGuard(Arc<dyn Gpu>);
 impl Drop for ResetGuard {
     fn drop(&mut self) {
@@ -499,6 +550,24 @@ fn main() {
         ui.event("↻", &note, Tone::Warn);
     }
 
+    let _sleep_guard = match SleepGuard::start() {
+        Ok(g) => {
+            ui.event(
+                "☾",
+                "sleep and idle suspend are blocked while tuning",
+                Tone::Normal,
+            );
+            Some(g)
+        }
+        Err(e) => {
+            ui.event(
+                "!",
+                &format!("couldn't block sleep ({e}): make sure the computer doesn't suspend"),
+                Tone::Warn,
+            );
+            None
+        }
+    };
     let clock = RealClock::new();
     let env = flow::Env {
         gpu: gpu.as_ref(),
@@ -568,5 +637,19 @@ fn main() {
                 power_mw: pl,
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sleep_guard_fails_gracefully_or_holds_the_lock() {
+        match super::SleepGuard::start() {
+            Ok(g) => {
+                assert!(g.0.is_some());
+                drop(g); // releases the lock
+            }
+            Err(e) => assert!(e.contains("systemd-inhibit"), "{e}"),
+        }
     }
 }

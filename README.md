@@ -29,6 +29,9 @@ Enter in LACT (for P0, the highest P-state):
    Power limit         320 W (default)
 ```
 
+While it runs, the computer won't go to sleep (it holds a systemd-logind inhibitor, released
+automatically when the tuner ends, even if it's killed).
+
 **Ctrl+C (or q) stops safely at any time**: the GPU goes back to stock and progress is saved.
 Run it again to continue. Driver crashes during testing are expected (that's how limits are
 found), and even a crash that needs a reboot is survived: the setting that was running is
