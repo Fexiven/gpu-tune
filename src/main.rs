@@ -5,6 +5,7 @@
 
 mod flow;
 mod hw;
+mod nvapi;
 mod nvml;
 mod proto;
 mod report;
@@ -373,9 +374,6 @@ fn main() {
             real.info().name,
             real.vram.status
         );
-        if !real.vram.keys.is_empty() {
-            println!("  sensors LACT reports: {}", real.vram.keys.join(", "));
-        }
         for _ in 0..if real.vram.ok() { 5 } else { 0 } {
             match real.vram.read() {
                 Some(v) => println!("  VRAM {v:.1}°C   GPU {}°C", real.temp().unwrap_or(0)),
@@ -473,10 +471,22 @@ fn main() {
     );
     match gpu.vram() {
         Some(v) => {
-            ui.event("🌡", &format!("memory temperature sensor found: {v:.0}°C"), Tone::Good);
-            ui.event("!", "if LACT is running, turn off its automatic profile switching while tuning", Tone::Warn);
+            ui.event(
+                "🌡",
+                &format!("memory temperature sensor found: {v:.0}°C"),
+                Tone::Good,
+            );
+            ui.event(
+                "!",
+                "if LACT is running, turn off its automatic profile switching while tuning",
+                Tone::Normal,
+            );
         }
-        None => ui.event("!", "memory temperature not available (start the LACT daemon to get it); continuing without it", Tone::Warn),
+        None => ui.event(
+            "!",
+            "memory temperature not available (see --check-vram); continuing without it",
+            Tone::Warn,
+        ),
     }
     if !note.is_empty() {
         ui.event("↻", &note, Tone::Warn);

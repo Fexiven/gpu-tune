@@ -1,13 +1,13 @@
 //! GPU control and sensors: clock offsets (P0, read back after every change), clock cap,
 //! power limit, readings, memory temperature, and NVIDIA driver errors from the kernel log.
 
+use crate::nvapi::NvApiVram;
 use crate::nvml::{self, Handle, Nvml};
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 pub const HARD_CORE: (i32, i32) = (0, 600);
 pub const HARD_MEM: (i32, i32) = (0, 4000);
@@ -336,146 +336,55 @@ impl KernelLog {
 }
 
 // =================================================================== VRAM temperature
-/// Memory temperature: from the LACT daemon if it's running (LACT 0.10+ reports per-chip
-/// temperatures on NVIDIA), otherwise from the card's register like the gddr6 tool.
+/// Memory temperature: through NvAPI (comes with the driver, works out of the box), otherwise
+/// straight from the card's register like the gddr6 tool (needs Secure Boot off and sometimes
+/// the kernel option iomem=relaxed).
 pub struct VramSensor {
-    lact: Option<LactVram>,
+    nvapi: Option<NvApiVram>,
     reg: Option<RegisterVram>,
     pub status: String,
-    pub keys: Vec<String>,
 }
 
 impl VramSensor {
     pub fn new(bus: &str, dev_id: u32) -> Self {
-        let (lact, lact_msg, keys) = match LactVram::new(bus) {
-            Ok(l) => {
-                let k = l.keys.clone();
-                (Some(l), String::new(), k)
+        // "0000:01:00.0" -> PCI bus number 0x01
+        let pci_bus = bus
+            .split(':')
+            .nth(1)
+            .and_then(|b| u32::from_str_radix(b, 16).ok())
+            .unwrap_or(0);
+        let nv_err = match NvApiVram::new(pci_bus) {
+            Ok(n) => {
+                return VramSensor {
+                    nvapi: Some(n),
+                    reg: None,
+                    status: "ok (NvAPI)".into(),
+                };
             }
-            Err((e, k)) => (None, e, k),
+            Err(e) => format!("{e:#}"),
         };
-        if lact.is_some() {
-            return VramSensor {
-                lact,
-                reg: None,
-                status: "ok (via LACT)".into(),
-                keys,
-            };
-        }
         match RegisterVram::new(bus, dev_id) {
             Ok(r) => VramSensor {
-                lact: None,
+                nvapi: None,
                 reg: Some(r),
                 status: "ok (register)".into(),
-                keys,
             },
             Err(e) => VramSensor {
-                lact: None,
+                nvapi: None,
                 reg: None,
-                status: format!("not readable: {lact_msg}; register: {e}"),
-                keys,
+                status: format!("not readable: NvAPI: {nv_err}; register: {e}"),
             },
         }
     }
     pub fn ok(&self) -> bool {
-        self.lact.is_some() || self.reg.is_some()
+        self.nvapi.is_some() || self.reg.is_some()
     }
     pub fn read(&self) -> Option<f64> {
-        if let Some(l) = &self.lact {
-            return l.read();
+        match (&self.nvapi, &self.reg) {
+            (Some(n), _) => n.read(),
+            (None, Some(r)) => r.read(),
+            _ => None,
         }
-        self.reg.as_ref().and_then(|r| r.read())
-    }
-}
-
-pub struct LactVram {
-    id: String,
-    cache: Mutex<(Instant, Option<f64>)>,
-    keys: Vec<String>,
-}
-
-const LACT_SOCK: &str = "/run/lactd.sock";
-
-impl LactVram {
-    fn request(msg: &serde_json::Value) -> Result<serde_json::Value> {
-        let mut s = std::os::unix::net::UnixStream::connect(LACT_SOCK)?;
-        s.set_read_timeout(Some(Duration::from_secs(2)))?;
-        s.set_write_timeout(Some(Duration::from_secs(2)))?;
-        s.write_all(format!("{msg}\n").as_bytes())?;
-        // one JSON object per request; read until it parses (don't rely on a trailing newline)
-        let (mut buf, mut chunk) = (Vec::new(), [0u8; 65536]);
-        let r: serde_json::Value = loop {
-            let n = s.read(&mut chunk)?;
-            if n == 0 {
-                bail!("LACT closed the connection");
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if let Ok(v) = serde_json::from_slice(&buf) {
-                break v;
-            }
-        };
-        if r["status"] != "ok" {
-            bail!(
-                "{}",
-                r["data"].to_string().chars().take(80).collect::<String>()
-            );
-        }
-        Ok(r["data"].clone())
-    }
-
-    /// (hottest memory temperature, all temperature sensor names)
-    fn fetch(id: &str) -> Result<(Option<f64>, Vec<String>)> {
-        let st =
-            Self::request(&serde_json::json!({"command": "device_stats", "args": {"id": id}}))?;
-        let temps = st["temps"].as_object().cloned().unwrap_or_default();
-        let keys = temps.keys().cloned().collect();
-        let v = temps
-            .iter()
-            .filter(|(k, _)| {
-                let k = k.to_lowercase();
-                k.contains("vram") || k.contains("mem")
-            })
-            .filter_map(|(_, e)| e["current"].as_f64())
-            .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))));
-        Ok((v, keys))
-    }
-
-    fn new(bus: &str) -> std::result::Result<Self, (String, Vec<String>)> {
-        let devs = Self::request(&serde_json::json!({"command": "list_devices"}))
-            .map_err(|e| (format!("LACT not reachable ({e})"), vec![]))?;
-        let id = devs
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|d| d["id"].as_str())
-            .find(|id| id.to_lowercase().ends_with(bus))
-            .ok_or_else(|| ("GPU not found in LACT".to_string(), vec![]))?
-            .to_string();
-        match Self::fetch(&id) {
-            Ok((Some(v), keys)) => Ok(LactVram {
-                id,
-                cache: Mutex::new((Instant::now(), Some(v))),
-                keys,
-            }),
-            Ok((None, keys)) => Err((
-                format!(
-                    "LACT reports no VRAM temperature (needs LACT 0.10+); sensors: {}",
-                    keys.join(", ")
-                ),
-                keys,
-            )),
-            Err(e) => Err((format!("LACT stats failed ({e})"), vec![])),
-        }
-    }
-
-    fn read(&self) -> Option<f64> {
-        let mut c = self.cache.lock().unwrap();
-        if c.0.elapsed() > Duration::from_millis(500) {
-            // LACT updates about once a second; don't flood it
-            c.1 = Self::fetch(&self.id).ok().and_then(|(v, _)| v);
-            c.0 = Instant::now();
-        }
-        c.1
     }
 }
 

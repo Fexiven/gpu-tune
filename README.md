@@ -84,10 +84,13 @@ cooling can't keep up.
 
 ## Memory temperature
 
-GDDR6X gets hot. The tuner reads the memory temperature from the LACT daemon if it's running
-(LACT 0.10+), otherwise straight from the card's register like the
+GDDR6X gets hot, so the tuner watches it and won't pick a memory offset that heats it too much.
+NVIDIA's NVML doesn't report memory temperature on GeForce cards, so it's read through NvAPI
+(`libnvidia-api.so.1`, part of the driver since 525), the same way LACT does it; no setup needed.
+On older drivers it falls back to the card's register like the
 [gddr6](https://github.com/olealgoritme/gddr6) tool (needs Secure Boot off and sometimes the
-kernel option `iomem=relaxed`). Without it, everything else still works.
+kernel option `iomem=relaxed`). Without either, everything else still works. Check with
+`gpu-tune --check-vram`.
 
 If LACT is running, turn off its automatic profile switching while tuning.
 
