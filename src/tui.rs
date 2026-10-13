@@ -42,13 +42,8 @@ pub struct TuiUi {
 }
 
 fn hhmm() -> String {
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&t, &mut tm) };
-    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+    let t = crate::ui::local_time();
+    format!("{:02}:{:02}", t.tm_hour, t.tm_min)
 }
 
 pub fn fmt_time(s: f64) -> String {

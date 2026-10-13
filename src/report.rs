@@ -1,13 +1,13 @@
 //! The final summary (also saved to gpu_tune_result.txt) and the optional benchmark check.
 
+use crate::decide::game_rel;
 use crate::hw::{Gpu, Settings};
 use crate::state::{State, give_back, profile_label};
-use crate::tuner::game_rel;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub fn report_text(gpu: &dyn Gpu, st: &State, _goal: &str) -> String {
+pub fn report_text(gpu: &dyn Gpu, st: &State) -> String {
     let info = gpu.info();
     let cal = st.p1.calib.clone().unwrap_or_default();
     let mut l: Vec<String> = vec![];

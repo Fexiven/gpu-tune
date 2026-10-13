@@ -1,22 +1,14 @@
 //! The two passes, the three profiles and their soak tests.
 
-use crate::hw::Gpu;
-use crate::runner::{Clock, R, Runner};
-use crate::state::{Baseline, Pass, PassState, Prof, ResultRec, Saver, profile_label};
-use crate::tuner::{
-    PassArgs, Profiles, Tuner, auto_clocks, game_rel, interpolate_hints, select_profiles,
+use crate::decide::{
+    Profiles, auto_clocks, game_rel, interpolate_hints, prof_power, select_profiles,
 };
-use crate::ui::{Finding, Log, RowState, Tone, Ui};
+use crate::runner::R;
+use crate::state::{Baseline, Pass, PassState, Prof, ResultRec, profile_label};
+pub use crate::tuner::Env;
+use crate::tuner::{PassArgs, Tuner};
+use crate::ui::{Finding, RowState, Tone};
 use std::collections::BTreeMap;
-
-pub struct Env<'a> {
-    pub gpu: &'a dyn Gpu,
-    pub runner: &'a dyn Runner,
-    pub clock: &'a dyn Clock,
-    pub ui: &'a dyn Ui,
-    pub log: &'a Log,
-    pub saver: &'a Saver,
-}
 
 pub const PROFILE_NAMES: [&str; 3] = ["efficient", "balanced", "max"];
 
@@ -72,17 +64,7 @@ pub fn tune(e: &Env, base_args: &PassArgs, goal: &str, quick_only: bool, single:
     } else {
         "Pass 1 of 2 · scanning the whole range with short tests"
     });
-    let mut t1 = Tuner::new(
-        e.gpu,
-        e.runner,
-        e.clock,
-        e.ui,
-        e.log,
-        e.saver,
-        p1,
-        take(Pass::P1),
-        Pass::P1,
-    );
+    let mut t1 = Tuner::new(e, p1, take(Pass::P1), Pass::P1);
     let r1 = (|| -> R<_> {
         let b1 = t1.baseline()?;
         if t1.a.clocks.is_empty() {
@@ -163,17 +145,7 @@ pub fn tune(e: &Env, base_args: &PassArgs, goal: &str, quick_only: bool, single:
         p2.clocks.first().unwrap_or(&0),
         p2.clocks.last().unwrap_or(&0)
     ));
-    let mut t2 = Tuner::new(
-        e.gpu,
-        e.runner,
-        e.clock,
-        e.ui,
-        e.log,
-        e.saver,
-        p2.clone(),
-        st2,
-        Pass::P2,
-    );
+    let mut t2 = Tuner::new(e, p2.clone(), st2, Pass::P2);
     let r = (|| -> R<_> {
         let b2 = t2.baseline()?;
         t2.calibrate()?;
@@ -225,12 +197,7 @@ fn soak_all(e: &Env, t: &mut Tuner, profs: &Profiles, names: &[&str]) -> R<Soake
             "efficient" => t.power_search(n, p, 0.03)?,
             _ => t.power_search(n, p, 0.01)?,
         };
-        let key = (
-            p.max_clock,
-            p.core,
-            p.mem,
-            crate::tuner::prof_power(&p, e.gpu.info()),
-        );
+        let key = (p.max_clock, p.core, p.mem, prof_power(&p, e.gpu.info()));
         if let Some((_, r)) = by_settings.iter().find(|(k, _)| *k == key) {
             e.ui.event(
                 "•",

@@ -3,6 +3,7 @@
 //! Test loads are Vulkan, like games, so the card runs in P0 with game clocks (CUDA would
 //! force P2). Every result is checked bit-for-bit; crashes, reboots and Ctrl+C are survived.
 
+mod decide;
 mod flow;
 mod hw;
 mod nvapi;
@@ -26,7 +27,6 @@ use runner::{ProcessRunner, RealClock, Runner, Stop};
 use state::{Saver, Sig, State};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use tuner::PassArgs;
 use ui::{Log, PlainUi, Tone, Ui};
 
@@ -37,7 +37,7 @@ use ui::{Log, PlainUi, Tone, Ui};
     about = "Automatic overclock / undervolt finder for NVIDIA GPUs on Linux.",
     long_about = "Finds the best stable clock offset, clock cap and memory offset for your NVIDIA card, \
                         tested with Vulkan loads like games, and tells you what to enter in LACT.\n\n\
-                        Finds three profiles (efficient, balanced, performance), each soak-tested, in about 1 hour 40 minutes (--single: one profile, ~75 min; --quick-only: ~45 min). Ctrl+C stops safely at any time \
+                        Finds three profiles (efficient, balanced, performance), each soak-tested, in about 1 hour 30 minutes (--single: one profile, ~65 min; --quick-only: ~40 min). Ctrl+C stops safely at any time \
                         (GPU goes back to stock); run it again to continue where it stopped."
 )]
 struct Cli {
@@ -45,10 +45,10 @@ struct Cli {
     /// power), efficient (least power, ~2% slower at most), performance (fastest; "max" works too)
     #[arg(long, default_value = "balanced", value_parser = ["balanced", "efficient", "performance", "max"])]
     goal: String,
-    /// only find and soak-test the --goal profile (faster, ~75 min)
+    /// only find and soak-test the --goal profile (faster, ~65 min)
     #[arg(long)]
     single: bool,
-    /// only the rough pass (~45 min, ~25 min with --single)
+    /// only the rough pass (~40 min, ~30 min with --single)
     #[arg(long)]
     quick_only: bool,
     /// ignore saved progress and start over
@@ -422,7 +422,7 @@ fn main() {
             let gpu: Arc<dyn Gpu> = Arc::new(hw::NullGpu(info));
             let runner = ProcessRunner { gpu: gpu.clone() };
             let base = base_args(&cli, gpu.as_ref());
-            let _ = ctrlc::set_handler(|| runner::INTERRUPTED.store(true, Ordering::SeqCst));
+            runner::catch_signals();
             std::process::exit(if self_test(&runner, &base) { 0 } else { 1 });
         }
     } else {
@@ -450,7 +450,7 @@ fn main() {
         }
         if !real.vram.ok() {
             println!(
-                "Easiest fix: make sure the LACT daemon (0.10 or newer) is running:  systemctl status lactd"
+                "It's read through NvAPI (libnvidia-api.so.1, NVIDIA driver 525 or newer). Everything else works without it."
             );
         }
         return;
@@ -459,7 +459,7 @@ fn main() {
     let _guard = ResetGuard(gpu.clone());
     let runner = ProcessRunner { gpu: gpu.clone() };
     let base = base_args(&cli, gpu.as_ref());
-    let _ = ctrlc::set_handler(|| runner::INTERRUPTED.store(true, Ordering::SeqCst));
+    runner::catch_signals();
     if cli.self_test {
         std::process::exit(if self_test(&runner, &base) { 0 } else { 1 });
     }
@@ -493,18 +493,16 @@ fn main() {
     let p1 = PassArgs::for_pass(&base, true);
     let p2 = PassArgs::for_pass(&base, false);
     let profiles = if cli.single { 1.0 } else { 3.0 };
-    let est = tuner::est_pass1(&p1)
+    let est = decide::est_pass1(&p1)
         + if cli.quick_only {
-            profiles * (tuner::est_soak(&p1) + tuner::est_power(&p1))
+            profiles * (decide::est_soak(&p1) + decide::est_power(&p1))
         } else {
             // three profiles: ~3 clock caps around each, partly shared; power search for two
-            tuner::est_pass2(&p2, if cli.single { 5 } else { 8 })
-                + profiles * tuner::est_soak(&p2)
-                + profiles.min(2.0) * tuner::est_power(&p2)
+            decide::est_pass2(&p2, if cli.single { 5 } else { 6 })
+                + profiles * decide::est_soak(&p2)
+                + profiles.min(2.0) * decide::est_power(&p2)
         };
-    let t = unix_now() as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&t, &mut tm) };
+    let tm = ui::local_time();
     let log_path = cli.dir.join(format!(
         "gpu_tune_log_{:04}{:02}{:02}_{:02}{:02}{:02}.csv",
         tm.tm_year + 1900,
@@ -627,7 +625,7 @@ fn main() {
         }
     }
     let st = saver.state.lock().unwrap().clone();
-    let text = report::report_text(gpu.as_ref(), &st, &cli.goal);
+    let text = report::report_text(gpu.as_ref(), &st);
     report::save_report(&cli.dir, gpu.as_ref(), &text);
     println!(
         "\n===== ⚡ GPU TUNE: done in {:.0} min =====\n\n{text}\n\n(saved to gpu_tune_result.txt)",
@@ -637,7 +635,7 @@ fn main() {
         && let Some(r) = &st.result
     {
         let rec = &r.recommended;
-        let pl = tuner::prof_power(rec, &info);
+        let pl = decide::prof_power(rec, &info);
         report::game_check(
             gpu.clone(),
             Settings {

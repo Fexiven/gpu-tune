@@ -2,7 +2,7 @@
 
 use crate::hw::{Gpu, Snap};
 use crate::proto::{Kind, Params, WorkResult};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,19 @@ pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 pub fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
+}
+
+extern "C" fn on_signal(_: libc::c_int) {
+    // only an atomic store: safe inside a signal handler
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+/// Ctrl+C, `kill` and a closed terminal all stop the tuner the safe way (GPU back to stock,
+/// progress saved) instead of killing it mid-test.
+pub fn catch_signals() {
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
+    }
 }
 
 /// Why the tuning stops early.
@@ -103,16 +116,20 @@ pub trait Runner: Send + Sync {
 const POWER_BITS: u64 = 0x4 | 0x80;
 const THERMAL_BITS: u64 = 0x8 | 0x20 | 0x40;
 
-/// Average the samples of one test: skip the warm-up; for loaded tests only count samples
-/// with the GPU busy (for the game-like load the idle gaps are part of the picture).
-pub fn summarize(samples: &[(f64, Snap)], skip: f64, loaded_only: bool) -> Summary {
+/// The worker prints this line when the measured part of a test starts (after opening the
+/// device, rendering the reference and the warm-up), so the averages cover only that part.
+pub const MEASURE_MARK: &str = "MEASURE";
+
+/// Average the samples of one test from `from` (seconds, same clock as the samples) on; for
+/// loaded tests only count samples with the GPU busy (for the game-like load the idle gaps
+/// between frames are part of the picture).
+pub fn summarize(samples: &[(f64, Snap)], from: f64, loaded_only: bool) -> Summary {
     if samples.is_empty() {
         return Summary::default();
     }
-    let t0 = samples[0].0 + skip;
     let mut win: Vec<&Snap> = samples
         .iter()
-        .filter(|(t, _)| *t >= t0)
+        .filter(|(t, _)| *t >= from)
         .map(|(_, s)| s)
         .collect();
     if win.is_empty() {
@@ -204,18 +221,36 @@ impl Runner for ProcessRunner {
             .stdin(Stdio::null())
             .spawn()
             .map_err(|e| Stop::Exit(format!("can't start a test: {e}")))?;
-        // read the pipes in threads so a chatty worker can't block on a full pipe
-        let pipe = |r: Option<Box<dyn Read + Send>>| {
+        // read the pipes in threads so a chatty worker can't block on a full pipe; stdout is
+        // read line by line to catch the moment the measurement starts
+        let measure_at: Arc<Mutex<Option<f64>>> = Default::default();
+        let out_t = {
+            let (out, at) = (child.stdout.take(), measure_at.clone());
             std::thread::spawn(move || {
                 let mut s = String::new();
-                if let Some(mut r) = r {
-                    let _ = r.read_to_string(&mut s);
+                if let Some(out) = out {
+                    for line in BufReader::new(out).lines().map_while(Result::ok) {
+                        if line == MEASURE_MARK {
+                            *at.lock().unwrap() = Some(t0.elapsed().as_secs_f64());
+                        } else {
+                            s.push_str(&line);
+                            s.push('\n');
+                        }
+                    }
                 }
                 s
             })
         };
-        let out_t = pipe(child.stdout.take().map(|x| Box::new(x) as _));
-        let err_t = pipe(child.stderr.take().map(|x| Box::new(x) as _));
+        let err_t = {
+            let err = child.stderr.take();
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                if let Some(mut e) = err {
+                    let _ = e.read_to_string(&mut s);
+                }
+                s
+            })
+        };
         let deadline = Instant::now() + Duration::from_secs_f64(p.seconds + p.warmup + 120.0);
         let mut reason = None;
         let mut stop = None;
@@ -277,9 +312,14 @@ impl Runner for ProcessRunner {
             })
             .unwrap_or_default();
         let samples = samples.lock().unwrap();
+        // without the mark (old worker, crash before it): skip the warm-up from the first sample
+        let from = measure_at
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| samples.first().map_or(0.0, |s| s.0) + p.warmup);
         Ok(Outcome {
             res,
-            summ: summarize(&samples, p.warmup, p.kind != Kind::Paced),
+            summ: summarize(&samples, from, p.kind != Kind::Paced),
             reason,
             why: why.chars().take(120).collect(),
         })
@@ -318,5 +358,8 @@ mod tests {
         assert_eq!(r.pstate, Some(0));
         let r = summarize(&v, 0.5, false);
         assert_eq!(r.core_clk, 1500.0);
+        // the window starts where the worker said the measurement starts
+        let r = summarize(&v, 2.0, false);
+        assert_eq!(r.core_clk, 2000.0);
     }
 }

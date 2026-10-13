@@ -602,7 +602,7 @@ fn offset_stops_where_the_voltage_floor_is_reached() {
 #[test]
 fn report_explains_power_limits_and_compares_performance_with_balanced() {
     let r = run(Card::default());
-    let t = crate::report::report_text(&FakeGpu::new(Card::default()), &r.state, "balanced");
+    let t = crate::report::report_text(&FakeGpu::new(Card::default()), &r.state);
     assert!(t.contains("why this limit:  stopped here because"), "{t}");
     assert!(t.contains("vs Balanced:"), "{t}");
 }
@@ -787,7 +787,7 @@ fn state_round_trips_through_json() {
     let txt = serde_json::to_string_pretty(&r.state).unwrap();
     let back: State = serde_json::from_str(&txt).unwrap();
     assert_eq!(serde_json::to_string_pretty(&back).unwrap(), txt);
-    let rep = crate::report::report_text(&FakeGpu::new(Card::default()), &back, "balanced");
+    let rep = crate::report::report_text(&FakeGpu::new(Card::default()), &back);
     assert!(
         rep.contains("GPU clock offset")
             && rep.contains("nvidia-smi should show the memory at about 12126 MHz"),
@@ -845,7 +845,7 @@ fn full_load_that_cant_reach_the_power_limit_is_reported() {
     let b = r.state.p1.baseline.as_ref().unwrap();
     assert!(!b.heavy_limited);
     assert_eq!(r.state.p1.heavy_alu, Some(512));
-    let rep = crate::report::report_text(&FakeGpu::new(Card::default()), &r.state, "balanced");
+    let rep = crate::report::report_text(&FakeGpu::new(Card::default()), &r.state);
     assert!(rep.contains("untested at full gaming power"), "{rep}");
 }
 
@@ -856,10 +856,10 @@ fn time_estimate_matches_a_simulated_run() {
     let (p1, p2) = (PassArgs::for_pass(&a, true), PassArgs::for_pass(&a, false));
     let r = run(Card::default());
     let n = r.state.p2.plan.len();
-    let est = (crate::tuner::est_pass1(&p1)
-        + crate::tuner::est_pass2(&p2, n)
-        + 3.0 * crate::tuner::est_soak(&p2)
-        + 2.0 * crate::tuner::est_power(&p2))
+    let est = (crate::decide::est_pass1(&p1)
+        + crate::decide::est_pass2(&p2, n)
+        + 3.0 * crate::decide::est_soak(&p2)
+        + 2.0 * crate::decide::est_power(&p2))
         / 60.0;
     eprintln!("pass 2 fine-tuned {n} clock caps");
     eprintln!("estimate {est:.0} min, simulated {:.0} min", r.sim_minutes);
@@ -892,7 +892,21 @@ fn print_sample_report() {
     let r = run(Card::default());
     println!(
         "{}",
-        crate::report::report_text(&FakeGpu::new(Card::default()), &r.state, "balanced")
+        crate::report::report_text(&FakeGpu::new(Card::default()), &r.state)
     );
     println!("\n[simulated {:.0} min]", r.sim_minutes);
+}
+
+#[test]
+#[ignore = "prints how long each mode takes on the simulated card"]
+fn print_durations() {
+    for (goal, quick) in [
+        ("balanced", false),
+        ("single:balanced", false),
+        ("balanced", true),
+        ("single:balanced", true),
+    ] {
+        let r = run_with(Card::default(), State::default(), goal, quick, None);
+        println!("{goal} quick={quick}: {:.0} min", r.sim_minutes);
+    }
 }

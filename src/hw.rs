@@ -21,6 +21,17 @@ pub struct Settings {
     pub power_mw: u32,
 }
 
+impl Settings {
+    /// "2850" or "stock"
+    pub fn cap(&self) -> String {
+        self.clock.map_or("stock".into(), |c| c.to_string())
+    }
+    /// "+225 @2850", the short form used in the dashboard
+    pub fn short(&self) -> String {
+        format!("{:+} @{}", self.core, self.cap())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Snap {
     pub power: f64,

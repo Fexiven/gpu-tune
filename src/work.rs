@@ -71,11 +71,19 @@ const COMPARE_WGSL: &str = r#"
 
 // Address-dependent pattern: every word depends on its own index and buffer, so data
 // written to or read from the wrong address shows up as an error too.
-const MEM_WGSL: &str = r#"
+macro_rules! mem_pattern {
+    () => {
+        r#"
 struct M { buf: u32, pad0: u32, pad1: u32, pad2: u32 }
 fn pattern(i: u32, b: u32) -> u32 { return (i * 2654435761u) ^ (0x9E3779B9u + b * 0x85EBCA6Bu); }
-
 @group(0) @binding(0) var<uniform> m: M;
+"#
+    };
+}
+
+const MEM_WGSL: &str = concat!(
+    mem_pattern!(),
+    r#"
 @group(0) @binding(1) var<storage, read_write> data: array<u32>;
 @compute @workgroup_size(256) fn fill(@builtin(global_invocation_id) g: vec3<u32>,
                                       @builtin(num_workgroups) n: vec3<u32>) {
@@ -83,13 +91,12 @@ fn pattern(i: u32, b: u32) -> u32 { return (i * 2654435761u) ^ (0x9E3779B9u + b 
     let len = arrayLength(&data);
     for (var i = g.x; i < len; i = i + stride) { data[i] = pattern(i, m.buf); }
 }
-"#;
+"#
+);
 
-const CHECK_WGSL: &str = r#"
-struct M { buf: u32, pad0: u32, pad1: u32, pad2: u32 }
-fn pattern(i: u32, b: u32) -> u32 { return (i * 2654435761u) ^ (0x9E3779B9u + b * 0x85EBCA6Bu); }
-
-@group(0) @binding(0) var<uniform> m: M;
+const CHECK_WGSL: &str = concat!(
+    mem_pattern!(),
+    r#"
 @group(0) @binding(1) var<storage, read> data: array<u32>;
 @group(0) @binding(2) var<storage, read_write> cnt: array<atomic<u32>, 2>;
 @compute @workgroup_size(256) fn check(@builtin(global_invocation_id) g: vec3<u32>,
@@ -102,7 +109,8 @@ fn pattern(i: u32, b: u32) -> u32 { return (i * 2654435761u) ^ (0x9E3779B9u + b 
     }
     if (bad > 0u) { atomicAdd(&cnt[1], bad); }
 }
-"#;
+"#
+);
 
 const MEM_GROUPS: u32 = 1024;
 
@@ -730,6 +738,40 @@ fn read_counters(g: &Gfx, cnt: &wgpu::Buffer) -> Result<(u64, u64)> {
 }
 
 // ------------------------------------------------------------------ the tests
+/// Tell the tuner the measured part starts now (it averages the GPU samples from here).
+fn mark_measure() {
+    use std::io::Write;
+    let mut o = std::io::stdout().lock();
+    let _ = writeln!(o, "{}", crate::runner::MEASURE_MARK);
+    let _ = o.flush();
+}
+
+/// Keeps one batch queued behind the running one, so the GPU never waits for the CPU between
+/// batches (a full load must stay full). Returns the passes completed while `until` holds.
+fn render_loop(
+    g: &Gfx,
+    rd: &Render,
+    per_batch: u32,
+    mut until: impl FnMut() -> bool,
+) -> Result<u64> {
+    let submit = || {
+        let mut enc = g.encoder();
+        for _ in 0..per_batch {
+            rd.pass(&mut enc);
+        }
+        g.queue.submit([enc.finish()])
+    };
+    let (mut prev, mut done) = (submit(), 0u64);
+    while until() {
+        let next = submit();
+        g.wait(prev)?;
+        done += per_batch as u64;
+        prev = next;
+    }
+    g.wait(prev)?;
+    Ok(done + per_batch as u64)
+}
+
 pub fn run(p: &Params) -> Result<WorkResult> {
     let g = open(&p.bus)?;
     let cnt = counters(&g);
@@ -747,23 +789,11 @@ pub fn run(p: &Params) -> Result<WorkResult> {
         Kind::Heavy => {
             let rd = Render::new(&g, p, &cnt)?;
             r.hash = Some(rd.make_reference(&g)?);
-            let batch = |n: u32| -> Result<()> {
-                let mut enc = g.encoder();
-                for _ in 0..n {
-                    rd.pass(&mut enc);
-                }
-                g.submit_wait(enc)
-            };
             let end = deadline(p.warmup);
-            while Instant::now() < end {
-                batch(4)?;
-            }
+            render_loop(&g, &rd, 4, || Instant::now() < end)?;
+            mark_measure();
             let (t0, end) = (Instant::now(), deadline(p.seconds));
-            let mut passes = 0u64;
-            while Instant::now() < end {
-                batch(4)?;
-                passes += 4;
-            }
+            let passes = render_loop(&g, &rd, 4, || Instant::now() < end)?;
             r.perf = Some(passes as f64 * rd.work_per_pass() / t0.elapsed().as_secs_f64() / 1e9);
         }
         Kind::Paced => {
@@ -771,6 +801,7 @@ pub fn run(p: &Params) -> Result<WorkResult> {
             r.hash = Some(rd.make_reference(&g)?);
             let frame = 1.0 / p.fps.max(1) as f64;
             let (mut frames, mut missed, mut busy) = (0u64, 0u64, 0.0);
+            mark_measure();
             let end = deadline(p.seconds);
             while Instant::now() < end {
                 let fs = Instant::now();
@@ -795,6 +826,7 @@ pub fn run(p: &Params) -> Result<WorkResult> {
         Kind::Mem => {
             let mem = Mem::new(&g, p.mem_mb, &cnt, p.inject)?;
             let (mut moved, mut secs) = (0.0, 0.0);
+            mark_measure();
             let end = deadline(p.seconds);
             while Instant::now() < end {
                 let (b, s) = mem.copies(&g, 10)?;
@@ -817,10 +849,9 @@ pub fn run(p: &Params) -> Result<WorkResult> {
                 g.submit_wait(enc)
             };
             let end = deadline(p.warmup);
-            while Instant::now() < end {
-                core(4)?;
-            }
+            render_loop(&g, &rd, 4, || Instant::now() < end)?;
             let (mut moved, mut secs) = (0.0, 0.0);
+            mark_measure();
             let end = deadline(p.seconds);
             while Instant::now() < end {
                 core(3)?;

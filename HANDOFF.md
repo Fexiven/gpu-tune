@@ -51,7 +51,7 @@ The two must always be used together (README explains this to users).
    balanced ≤1%); performance checks the max power limit; sleep inhibitor (systemd-inhibit).
    Decided NOT to run every test at several power limits (see README "How it works" step 6).
 10. v0.6: power search walks down in 10 W steps from the profile's measured draw and stops at
-    the knee (`pick_knee` in `tuner.rs`: step elasticity perf-loss/power-save > 0.6, steps
+    the knee (`pick_knee` in `decide.rs`: step elasticity perf-loss/power-save > 0.6, steps
     saving < 0.5% ignored, total loss capped, total save ≥ max(3%, 3× noise)). The offset stays
     fixed while the limit changes (asked by the user; answer in README step 6). Pass 1's clock
     caps now default to the card's stock boost −300/−150/0/+150 (`auto_clocks`), capped at
@@ -66,6 +66,14 @@ The two must always be used together (README explains this to users).
     power saved with each core search step as `{"ok":true,"pp":W}`); stock measured three
     times; report says why each power limit was chosen (`Prof::power_note`) and compares
     Performance with Balanced.
+12. v0.8, clean-up and speed: `tuner.rs` split into `decide.rs` (pure rules + their tests) and
+    `tuner/` (one file per phase); offset search no longer tests +0 up front (implied by any
+    higher offset passing) and pass 2 starts ±2 steps around pass 1's limit (was ±4): the
+    simulated run went from 109 to 96 min with the same settings. Worker prints `MEASURE` when
+    the measured part starts, so averages no longer include device start-up and reference
+    rendering (this skewed the game-like clock/power of short tests); the full load keeps one
+    batch queued so the GPU never waits for the CPU. `ctrlc` replaced by a libc signal handler,
+    ratatui without default features (124 → 114 crates, clean release build 157 → 133 s).
 
 ## 4. Architecture (src/)
 
@@ -73,10 +81,15 @@ The two must always be used together (README explains this to users).
 |---|---|
 | `main.rs` | CLI (clap), sudo re-exec (passes Vulkan/NixOS env vars through), modes (`--self-test`, `--check-vram`), saved-progress loading (`load_state`), sleep guard, reset guard, report + `--game-check` |
 | `flow.rs` | the overall flow: pass 1 (wide, short tests), pass 2 (planned around each profile's clock), per-profile maxpower / power search, soak per profile, result |
-| `tuner.rs` | the logic: `Tuner` (baseline + load calibration, `calibrate` (P0 check, memory offset units), core-offset effect check, memory sweep/hot pick, core bisection, measurement, `maxpower`, `power_search`, idle check, `soak`), `probe` (crash-proof memo), `search_bounds`, `select_profiles`, `interpolate_hints`, time estimates |
+| `decide.rs` | the decision rules, no hardware: `search_bounds` (offset bisection), `pick_mem`, `floor_offset`, `power_stop`/`pick_knee`, `select_profiles`, `auto_clocks`, `interpolate_hints`, noise (`mean`, `spread`), time estimates; most unit tests live here |
+| `tuner/mod.rs` | `Env` (GPU, runner, clock, UI, log, saver), `PassArgs`, `Tuner`: `probe` (crash-proof memo), `test` (apply, run, overheat retry, log), recovery, cooldown |
+| `tuner/baseline.rs` | stock baseline + load calibration, `calibrate` (P0 check, memory offset units), core-offset effect check |
+| `tuner/memory.rs` | memory sweep (cool), hot pick, error cap |
+| `tuner/core.rs` | per clock cap: offset search, voltage-floor check, measurement with margin |
+| `tuner/finals.rs` | `maxpower`, `power_search`, idle check, `soak` |
 | `work.rs` | the worker process (`gpu-tune --worker <json>`): wgpu device by PCI bus id; render load (fragment shader: FP32 math, texture sampling, random storage reads, optional ALU block) with a GPU-side bit-exact compare against a reference image after every pass; memory load (buffer copies + address-dependent pattern check); combo; `inject` for the self-test |
 | `proto.rs` | worker parameters/result (JSON), `golden_key` (reference image identity) |
-| `runner.rs` | starts a worker, samples NVML every 200 ms meanwhile, overheat/hang handling, `summarize`; `Stop` enum, `Clock` trait, `INTERRUPTED` flag |
+| `runner.rs` | starts a worker, samples NVML every 200 ms meanwhile, overheat/hang handling, `summarize` (from the worker's `MEASURE` line on); Ctrl+C/SIGTERM/SIGHUP handler; `Stop` enum, `Clock` trait, `INTERRUPTED` flag |
 | `hw.rs` | `Gpu` trait + `RealGpu` (NVML control, P0 offsets with read-back, ranges), `NullGpu` (self-test without NVML), kernel log (`/dev/kmsg` Xid watcher), VRAM sensor (NvAPI then register) |
 | `nvml.rs` / `nvapi.rs` | hand-written FFI |
 | `state.rs` | saved progress (`gpu_tune_state.json`, atomic writes, chown back to `SUDO_UID`), `Sig` (invalidates progress when driver/settings/STATE_VERSION change), result types |
@@ -106,7 +119,7 @@ Key mechanisms worth knowing before changing anything:
 
 | what | how verified |
 |---|---|
-| whole tuning flow, crashes, reboots, Ctrl+C, overheat, three profiles, power search, calibrations, estimates | `cargo test`: 38 tests incl. simulated card (`sim.rs`) |
+| whole tuning flow, crashes, reboots, Ctrl+C, overheat, three profiles, power search, calibrations, estimates | `cargo test`: 39 tests (+2 ignored printers: `print_sample_report`, `print_durations`) incl. simulated card (`sim.rs`) |
 | Vulkan loads run, are deterministic, detect injected errors | lavapipe in the dev container: `gpu-tune --self-test --vulkan-device any --width 320 --height 192 --mem-mb 64`; user's 4080 SUPER: `--self-test` all ok, P0 |
 | VRAM temperature via NvAPI | user's card: `--check-vram` ok |
 | NixOS flake builds and runs | user's machine (v0.2); CI builds it on every push (`nix build`) |

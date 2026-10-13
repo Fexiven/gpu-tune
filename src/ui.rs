@@ -4,6 +4,22 @@
 use std::io::Write;
 use std::sync::Mutex;
 
+/// Local wall-clock time.
+pub fn local_time() -> libc::tm {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs()) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    tm
+}
+
+/// "14:05:09"
+pub fn now_hms() -> String {
+    let t = local_time();
+    format!("{:02}:{:02}:{:02}", t.tm_hour, t.tm_min, t.tm_sec)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tone {
     Normal,
