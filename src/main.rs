@@ -37,14 +37,14 @@ use ui::{Log, PlainUi, Tone, Ui};
     about = "Automatic overclock / undervolt finder for NVIDIA GPUs on Linux.",
     long_about = "Finds the best stable clock offset, clock cap and memory offset for your NVIDIA card, \
                         tested with Vulkan loads like games, and tells you what to enter in LACT.\n\n\
-                        Takes about an hour (--quick-only: about 30 min). Ctrl+C stops safely at any time \
+                        Takes about 75 minutes (--quick-only: about 35 min). Ctrl+C stops safely at any time \
                         (GPU goes back to stock); run it again to continue where it stopped."
 )]
 struct Cli {
     /// what to optimise for: balanced (stock speed, clearly less power), efficient (least power, ~2% slower at most), max
     #[arg(long, default_value = "balanced", value_parser = ["balanced", "efficient", "max"])]
     goal: String,
-    /// only the rough pass (~30 min)
+    /// only the rough pass (~35 min)
     #[arg(long)]
     quick_only: bool,
     /// ignore saved progress and start over
@@ -78,7 +78,8 @@ struct Cli {
     core_max: i32,
     #[arg(long, default_value_t = 15)]
     core_step: i32,
-    #[arg(long, default_value_t = 30)]
+    /// safety margin below the highest stable core offset (MHz)
+    #[arg(long, default_value_t = 45)]
     core_margin: i32,
     #[arg(long, default_value_t = 4000)]
     mem_max: i32,
@@ -176,8 +177,12 @@ fn base_args(cli: &Cli, gpu: &dyn Gpu) -> PassArgs {
         fps: cli.fps.max(10),
         width: cli.width.max(64),
         height: cli.height.max(64),
-        iters_heavy: 128,
-        iters_paced: 64,
+        // full load: few memory steps, lots of math (calibrated up until it hits the power limit);
+        // game-like load: memory/texture-heavy, calibrated to ~60% busy per frame
+        iters_heavy: 8,
+        iters_paced: 16,
+        alu_heavy: 64,
+        alu_paced: 2,
         mem_mb: if cli.mem_mb > 0 {
             cli.mem_mb
         } else {
@@ -208,6 +213,7 @@ fn self_test(runner: &dyn Runner, a: &PassArgs) -> bool {
                 width: a.width,
                 height: a.height,
                 iters: a.iters_heavy,
+                alu: a.alu_heavy,
                 per_frame: 2,
                 fps: a.fps,
                 mem_mb: a.mem_mb.min(1024),
@@ -413,6 +419,7 @@ fn main() {
         height: base.height,
         iters_heavy: base.iters_heavy,
         iters_paced: base.iters_paced,
+        alu_heavy: base.alu_heavy,
     };
     let state_path = cli.dir.join("gpu_tune_state.json");
     let (st, note) = load_state(&state_path, &sig, &cli.goal, cli.quick_only, cli.fresh);

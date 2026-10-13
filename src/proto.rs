@@ -49,6 +49,9 @@ pub struct Params {
     pub height: u32,
     /// shader loop iterations per pixel and pass
     pub iters: u32,
+    /// pure-math steps per iteration (high = power-hungry full load)
+    #[serde(default)]
+    pub alu: u32,
     pub per_frame: u32,
     pub fps: u32,
     /// size of each of the two memory test buffer sets
@@ -61,7 +64,10 @@ pub struct Params {
 impl Params {
     /// key for the cross-run reference hash: same image => same key
     pub fn golden_key(&self) -> String {
-        format!("render:{}x{}:{}", self.width, self.height, self.iters)
+        format!(
+            "render:{}x{}:{}:{}",
+            self.width, self.height, self.iters, self.alu
+        )
     }
 }
 

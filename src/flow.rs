@@ -119,6 +119,8 @@ pub fn tune(e: &Env, base_args: &PassArgs, goal: &str, quick_only: bool) -> R<()
             st2.golden = p1_state.golden.clone();
         }
         st2.per_frame = st2.per_frame.or(p1_state.per_frame);
+        st2.paced_iters = st2.paced_iters.or(p1_state.paced_iters);
+        st2.heavy_alu = st2.heavy_alu.or(p1_state.heavy_alu);
         st2.calib = st2.calib.or_else(|| p1_state.calib.clone());
         st2.core_check_done |= p1_state.core_check_done;
         st2.bw_noise = st2.bw_noise.or(p1_state.bw_noise);

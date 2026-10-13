@@ -2,8 +2,8 @@
 
 Automatic overclock / undervolt finder for NVIDIA GPUs on Linux. It finds the best stable
 **core clock offset**, **clock cap** and **memory offset** for your card and tells you what to
-enter in [LACT](https://github.com/ilya-zlobintsev/LACT). It takes about an hour, and you can stop
-and continue at any time.
+enter in [LACT](https://github.com/ilya-zlobintsev/LACT). It takes about 75 minutes, and you can
+stop and continue at any time.
 
 Made for the RTX 4080 Super; works on RTX 30/40/50 cards with the proprietary driver (555+ recommended).
 
@@ -20,6 +20,7 @@ with something like:
 Recommended (balanced):
    game-like load:  core clock -0.4% vs stock, -25 W at a fixed 120 fps
    full load:       +3.2% performance, -1 W
+   Tested up to the power limit: full load drew 318 W at stock (320 W limit), 316 W tuned.
 
 Enter in LACT (for P0, the highest P-state):
    GPU clock offset    +150 MHz
@@ -40,7 +41,7 @@ counted as unstable next time.
 | `--goal balanced` | stock speed in games with clearly less power (default) |
 | `--goal efficient` | least power while at most ~2% slower |
 | `--goal max` | most performance |
-| `--quick-only` | only the rough pass (~30 min) |
+| `--quick-only` | only the rough pass (~35 min) |
 | `--self-test` | proves the error detection works on your machine (injects errors on purpose) |
 | `--game-check` | at the end, compare stock vs result in your own benchmark |
 | `--check-vram` | only test the memory temperature sensor |
@@ -65,15 +66,20 @@ pattern and checks every word. Each test runs in its own process, so a crash onl
 **Steps:**
 
 1. Stock performance, measured twice to know the run-to-run noise. Every later decision must
-   beat twice that noise, so random variation can't pick the result.
+   beat twice that noise, so random variation can't pick the result. Both test loads calibrate
+   themselves here: the full load gets heavier until it reaches the power limit (like a heavy
+   game: an undervolt that holds at low power can still crash at high power, where more current
+   means more voltage drop), and the game-like load is sized to ~60% busy per frame, so there are
+   real idle gaps between frames.
 2. Calibration: tests must run in P0; the memory offset's real effect is measured; a +60 core
    offset must actually raise the clock (otherwise the search would find nothing real).
 3. Memory: the bandwidth peak. Too much memory clock causes transfer retries (GDDR6X error
    detection and replay), which show up as lost bandwidth. The best steps are re-checked with a
    hot GPU, and a step only counts if it clearly adds bandwidth.
-4. Core: for several clock caps, a binary search for the highest stable offset under game-like
-   load (bursts at 120 fps: the card isn't power-limited, like most games). A higher offset at the
-   same clock cap means lower voltage, so less power. Then measured with a 30 MHz safety margin.
+4. Core: for several clock caps, a binary search for the highest stable offset. Each step runs
+   the game-like load (bursts at 120 fps, load changing every frame) and then the full load at
+   the power limit. A higher offset at the same clock cap means lower voltage, so less power. The
+   result is used with a 45 MHz safety margin (longer tests find lower limits).
 5. Pass 2 repeats steps 3-4 around the best area with full-length tests and finer steps.
 6. Soak test of the result: cold start, full load, game-like load, memory with a hot GPU, and
    **desktop idle with sudden load**. An offset shifts the whole voltage/frequency curve,
@@ -93,6 +99,20 @@ kernel option `iomem=relaxed`). Without either, everything else still works. Che
 `gpu-tune --check-vram`.
 
 If LACT is running, turn off its automatic profile switching while tuning.
+
+## Why a clock offset *and* a lower maximum clock?
+
+Linux has no direct voltage control for NVIDIA cards, so an undervolt takes two settings:
+
+1. The **clock offset** shifts the whole voltage/frequency curve up: every voltage step now runs
+   that many MHz faster.
+2. The **maximum GPU clock** stops the card from using that headroom to boost even higher. It
+   reaches the cap at a lower voltage than stock would need for that clock: less power and heat.
+
+The cap only looks low next to the slider's range: that range is the driver's maximum, not what
+the card actually runs (a 4080 Super boosts to ~2700-2800 MHz at stock). **Never use the offset
+without the cap**: the card would then boost to stock voltage plus the offset, a pure overclock
+the tuner never tested.
 
 ## After tuning
 

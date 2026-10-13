@@ -14,7 +14,7 @@ use wgpu::util::DeviceExt;
 static LOST: AtomicBool = AtomicBool::new(false);
 
 const RENDER_WGSL: &str = r#"
-struct P { iters: u32, seed: u32, pad0: u32, pad1: u32 }
+struct P { iters: u32, seed: u32, alu: u32, pad1: u32 }
 @group(0) @binding(0) var<uniform> prm: P;
 @group(0) @binding(1) var tex: texture_2d<f32>;
 @group(0) @binding(2) var smp: sampler;
@@ -28,6 +28,9 @@ struct P { iters: u32, seed: u32, pad0: u32, pad1: u32 }
 
 // Game-shader-like mix: FP32 math (FMA, transcendental), texture sampling with filtering,
 // random reads from a storage buffer (caches and memory), integer hashing.
+// `alu` adds a block of pure FP32 math per iteration (four independent FMA chains, so the GPU
+// can keep its math units full): high for the full load, which must reach the power limit like
+// a heavy game, low for the game-like load.
 @fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<u32> {
     var a = vec4<f32>(fract(pos.x * 0.0137), fract(pos.y * 0.0191), 0.5, 0.25);
     var h = u32(pos.x) * 1973u + u32(pos.y) * 9277u + prm.seed;
@@ -37,7 +40,18 @@ struct P { iters: u32, seed: u32, pad0: u32, pad1: u32 }
         let t = textureSampleLevel(tex, smp, uv, 0.0);
         let l = lut[(h >> 16u) & 65535u];
         a = fma(a, t + vec4<f32>(0.5), l);
-        a = fract(a * 1.37 + vec4<f32>(sin(a.x * 6.2), cos(a.y * 6.2), a.z * a.w, sqrt(a.w + 0.01)));
+        var b0 = a;
+        var b1 = a.yzwx;
+        var b2 = a.zwxy;
+        var b3 = a.wxyz;
+        for (var j = 0u; j < prm.alu; j = j + 1u) {
+            b0 = fma(b0, vec4<f32>(0.99991), b1 * 0.00013);
+            b1 = fma(b1, vec4<f32>(1.00007), b2 * -0.00011);
+            b2 = fma(b2, vec4<f32>(0.99993), b3 * 0.00017);
+            b3 = fma(b3, vec4<f32>(1.00003), b0 * -0.00019);
+        }
+        a = fract(a * 1.37 + (b0 + b1 + b2 + b3) * 0.25
+                  + vec4<f32>(sin(a.x * 6.2), cos(a.y * 6.2), a.z * a.w, sqrt(a.w + 0.01)));
     }
     return bitcast<vec4<u32>>(a) ^ vec4<u32>(h, h >> 7u, h << 3u, ~h);
 }
@@ -251,6 +265,7 @@ struct Render {
     w: u32,
     h: u32,
     iters: u32,
+    alu: u32,
 }
 
 fn counters(g: &Gfx) -> wgpu::Buffer {
@@ -300,7 +315,7 @@ impl Render {
         });
         let uni = d.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("params"),
-            contents: as_bytes(&[p.iters, 0x1234_5678u32, 0, 0]),
+            contents: as_bytes(&[p.iters, 0x1234_5678u32, p.alu, 0]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let sampler = d.create_sampler(&wgpu::SamplerDescriptor {
@@ -369,7 +384,7 @@ impl Render {
         let bad_bind = p.inject.then(|| {
             mk_bind(&d.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
-                contents: as_bytes(&[p.iters, 0x1234_5679u32, 0, 0]),
+                contents: as_bytes(&[p.iters, 0x1234_5679u32, p.alu, 0]),
                 usage: wgpu::BufferUsages::UNIFORM,
             }))
         });
@@ -440,6 +455,7 @@ impl Render {
             w,
             h,
             iters: p.iters,
+            alu: p.alu,
         })
     }
 
@@ -520,7 +536,8 @@ impl Render {
     }
 
     fn work_per_pass(&self) -> f64 {
-        self.w as f64 * self.h as f64 * self.iters as f64
+        // pixels x iterations x (memory/texture step + ALU block): only meaningful relative to stock
+        self.w as f64 * self.h as f64 * self.iters as f64 * (1.0 + self.alu as f64)
     }
 }
 

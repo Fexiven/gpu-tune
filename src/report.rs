@@ -35,6 +35,18 @@ pub fn report_text(gpu: &dyn Gpu, st: &State, goal: &str) -> String {
         "   (the clock figure doesn't include the memory overclock; check fps with --game-check)"
             .into(),
     );
+    if b.heavy_limited {
+        l.push(format!(
+            "   Tested up to the power limit: full load drew {:.0} W at stock ({:.0} W limit), {:.0} W tuned.",
+            b.heavy_power, b.power_limit_w, rec.heavy_power
+        ));
+    } else if b.power_limit_w > 0.0 {
+        l.push(format!(
+            "   Note: the full load only reached {:.0} W of {:.0} W, so the core offset is untested at full gaming power.",
+            b.heavy_power, b.power_limit_w
+        ));
+        l.push("   Check it in your most demanding game; lower the GPU clock offset by 15-30 if it crashes.".into());
+    }
     l.push(String::new());
     l.push(
         "Enter in LACT (for P0, the highest P-state, if LACT shows one row per P-state):".into(),

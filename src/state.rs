@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-pub const STATE_VERSION: u32 = 3;
+pub const STATE_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Noise {
@@ -26,6 +26,11 @@ pub struct Baseline {
     pub paced_clk: f64,
     pub pstate: Option<u32>,
     pub noise: Noise,
+    /// did the full load reach the power limit at stock (like a heavy game)?
+    #[serde(default)]
+    pub heavy_limited: bool,
+    #[serde(default)]
+    pub power_limit_w: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -63,6 +68,12 @@ pub struct Prof {
 pub struct PassState {
     pub golden: BTreeMap<String, String>,
     pub per_frame: Option<u32>,
+    /// calibrated work per pass of the game-like load
+    #[serde(default)]
+    pub paced_iters: Option<u32>,
+    /// calibrated math per step of the full load (until it reaches the power limit)
+    #[serde(default)]
+    pub heavy_alu: Option<u32>,
     pub baseline: Option<Baseline>,
     pub calib: Option<Calib>,
     pub core_check_done: bool,
@@ -96,6 +107,8 @@ pub struct Sig {
     pub height: u32,
     pub iters_heavy: u32,
     pub iters_paced: u32,
+    #[serde(default)]
+    pub alu_heavy: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -22,6 +22,10 @@ struct Card {
     offset_broken: bool,
     pstate: u32,
     stock_boost: f64,
+    /// game-like load: frame time multiplier (8 = the load is 8x too big at first)
+    paced_scale: f64,
+    /// full load: most power the shader can draw however heavy it gets
+    heavy_max_w: f64,
 }
 
 impl Default for Card {
@@ -36,6 +40,8 @@ impl Default for Card {
             offset_broken: false,
             pstate: 0,
             stock_boost: 2800.0,
+            paced_scale: 1.0,
+            heavy_max_w: 400.0,
         }
     }
 }
@@ -216,7 +222,10 @@ impl Runner for FakeRunner {
                 Kind::Paced => {
                     summ.core_clk = self.noise(clk, 0.001);
                     summ.power = self.noise(220.0 * volt * volt * clk / 2800.0, 0.002);
-                    r.busy = Some(0.6 * 2800.0 / clk);
+                    // busy grows with the work per frame (passes x steps), 60% at 1 x 16 steps
+                    r.busy = Some(
+                        0.6 * (p.per_frame * p.iters) as f64 / 16.0 * c.paced_scale * 2800.0 / clk,
+                    );
                     r.missed = Some(if clk > 2300.0 { 0 } else { 5 });
                     r.frames = Some(1000);
                     r.hash = Some("H".into());
@@ -224,8 +233,12 @@ impl Runner for FakeRunner {
                 Kind::Heavy => {
                     let h = clk.min(2650.0 + core as f64 * 0.6);
                     summ.core_clk = h;
-                    summ.power = self.noise(318.0, 0.002);
-                    summ.limit = "power".into();
+                    // more math per step = more power, until the 320 W limit (needs alu 256)
+                    let want = (100.0 + p.alu as f64 * 0.85).min(c.heavy_max_w);
+                    summ.power = self.noise(want.min(318.0), 0.002);
+                    if want >= 318.0 {
+                        summ.limit = "power".into();
+                    }
                     r.perf = Some(self.noise(52.0 * h / 2650.0, 0.002));
                     r.hash = Some("H".into());
                 }
@@ -293,7 +306,7 @@ fn args(gpu: &FakeGpu) -> PassArgs {
         refine_mem_top: false,
         core_max: 450,
         core_step: 15,
-        core_margin: 30,
+        core_margin: 45,
         mem_max: 4000,
         temp_limit: 87,
         vram_limit: 102.0,
@@ -301,8 +314,10 @@ fn args(gpu: &FakeGpu) -> PassArgs {
         fps: 120,
         width: 2560,
         height: 1440,
-        iters_heavy: 128,
-        iters_paced: 64,
+        iters_heavy: 8,
+        iters_paced: 16,
+        alu_heavy: 64,
+        alu_paced: 2,
         mem_mb: 5000,
         bus: gpu.info.bus.clone(),
         skip_offset_check: false,
@@ -421,7 +436,18 @@ fn finds_the_built_in_limits() {
     let r = run(Card::default());
     assert_eq!(r.res, Ok(()), "{:?}", r.events);
     let rec = &r.state.result.as_ref().expect("a result").recommended;
-    assert_eq!(rec.core, core_limit(Some(rec.max_clock)) - 30, "{rec:?}");
+    assert_eq!(
+        rec.core,
+        core_limit(Some(rec.max_clock)) / 15 * 15 - 45,
+        "{rec:?}"
+    );
+    // the full load was made heavier until it reached the power limit
+    assert_eq!(r.state.p1.heavy_alu, Some(256));
+    assert!(r.state.p1.baseline.as_ref().unwrap().heavy_limited);
+    assert_eq!(
+        (r.state.p1.per_frame, r.state.p1.paced_iters),
+        (Some(1), Some(16))
+    );
     assert_eq!(
         rec.mem, 1250,
         "last step before the simulated retries: {rec:?}"
@@ -637,4 +663,53 @@ fn saved_progress_is_reused_or_discarded_correctly() {
     let (s, note) = crate::load_state(&path, &other, "balanced", false, false);
     assert!(note.contains("changed") && s.p1.baseline.is_none());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn oversized_game_like_load_is_scaled_down() {
+    // like the real 4080 Super run: one pass already took 2x the frame time
+    let r = run(Card {
+        paced_scale: 8.0,
+        ..Default::default()
+    });
+    assert_eq!(r.res, Ok(()), "{:?}", r.events);
+    let st = &r.state.p1;
+    let busy = 0.6 * (st.per_frame.unwrap() * st.paced_iters.unwrap()) as f64 / 16.0 * 8.0;
+    assert!(
+        (0.45..=0.75).contains(&busy),
+        "{:?} {:?} -> busy {busy}",
+        st.per_frame,
+        st.paced_iters
+    );
+}
+
+#[test]
+fn full_load_that_cant_reach_the_power_limit_is_reported() {
+    let r = run(Card {
+        heavy_max_w: 200.0,
+        ..Default::default()
+    });
+    assert_eq!(r.res, Ok(()));
+    let b = r.state.p1.baseline.as_ref().unwrap();
+    assert!(!b.heavy_limited);
+    assert_eq!(r.state.p1.heavy_alu, Some(512));
+    let rep = crate::report::report_text(&FakeGpu::new(Card::default()), &r.state, "balanced");
+    assert!(rep.contains("untested at full gaming power"), "{rep}");
+}
+
+#[test]
+fn time_estimate_matches_a_simulated_run() {
+    let gpu = FakeGpu::new(Card::default());
+    let a = args(&gpu);
+    let (p1, p2) = (PassArgs::for_pass(&a, true), PassArgs::for_pass(&a, false));
+    let est =
+        (crate::tuner::est_pass1(&p1) + crate::tuner::est_pass2(&p2) + crate::tuner::est_soak(&p2))
+            / 60.0;
+    let r = run(Card::default());
+    eprintln!("estimate {est:.0} min, simulated {:.0} min", r.sim_minutes);
+    assert!(
+        est > r.sim_minutes * 0.7 && est < r.sim_minutes * 1.4,
+        "estimate {est:.0} vs simulated {:.0}",
+        r.sim_minutes
+    );
 }

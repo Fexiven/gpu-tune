@@ -37,6 +37,8 @@ pub struct PassArgs {
     pub height: u32,
     pub iters_heavy: u32,
     pub iters_paced: u32,
+    pub alu_heavy: u32,
+    pub alu_paced: u32,
     pub mem_mb: u64,
     pub bus: String,
     pub skip_offset_check: bool,
@@ -389,9 +391,14 @@ impl<'a> Tuner<'a> {
             width: a.width,
             height: a.height,
             iters: if kind == Kind::Paced {
-                a.iters_paced
+                self.st.paced_iters.unwrap_or(a.iters_paced)
             } else {
                 a.iters_heavy
+            },
+            alu: if kind == Kind::Paced {
+                a.alu_paced
+            } else {
+                self.st.heavy_alu.unwrap_or(a.alu_heavy)
             },
             per_frame: per_frame.or(self.st.per_frame).unwrap_or(6),
             fps: a.fps,
@@ -631,10 +638,50 @@ impl<'a> Tuner<'a> {
         );
         let s0 = self.set(0, 0, None);
         let fail = |m: &str| Stop::Exit(format!("{m} See the log file."));
-        let (ok, heavy) = self.test(Kind::Heavy, s0, self.a.measure, self.a.warm, None, true)?;
-        let heavy = heavy
-            .filter(|_| ok)
-            .ok_or_else(|| fail("The stock test failed, so something is wrong with the setup."))?;
+        let pl_w = self.dpl() as f64 / 1000.0;
+
+        // Full load: make it heavier until it reaches the power limit at stock, like a heavy
+        // game. An undervolt that only holds at low power can still crash at high power
+        // (more current, more voltage drop).
+        let mut alu = self.st.heavy_alu.unwrap_or(self.a.alu_heavy).max(1);
+        let mut warm = self.a.warm;
+        let (heavy, limited) = loop {
+            self.st.heavy_alu = Some(alu);
+            let (ok, r) = self.test(Kind::Heavy, s0, self.a.measure, warm, None, true)?;
+            let r = r.filter(|_| ok).ok_or_else(|| {
+                fail("The stock test failed, so something is wrong with the setup.")
+            })?;
+            let limited = r.limited_by.contains("power") || r.avg_power >= 0.9 * pl_w;
+            if limited || alu >= 512 {
+                break (r, limited);
+            }
+            self.ui.event(
+                "•",
+                &format!(
+                    "full load drew only {:.0} W of {pl_w:.0} W: making it heavier",
+                    r.avg_power
+                ),
+                Tone::Normal,
+            );
+            alu = (alu * 2).min(512);
+            warm = 10.0;
+        };
+        if limited {
+            self.ui.event(
+                "✓",
+                &format!(
+                    "full load reaches the power limit ({:.0} W), like a heavy game",
+                    heavy.avg_power
+                ),
+                Tone::Good,
+            );
+        } else {
+            self.ui.event(
+                "!",
+                &format!("full load reaches only {:.0} W of {pl_w:.0} W: results are tested below gaming power", heavy.avg_power),
+                Tone::Warn,
+            );
+        }
         let key = self.params(Kind::Heavy, 0.0, 0.0, None).golden_key();
         self.st
             .golden
@@ -644,32 +691,57 @@ impl<'a> Tuner<'a> {
             .filter(|_| ok)
             .ok_or_else(|| fail("The second stock test failed: the card is unstable at stock."))?;
 
-        // calibrate the game-like load to ~60% busy at stock
-        let paced_work = self.a.width as f64 * self.a.height as f64 * self.a.iters_paced as f64;
-        let t_pass = paced_work / (heavy.perf.max(1e-6) * 1e9) * 1.3;
-        let mut per_frame = self
-            .st
-            .per_frame
-            .unwrap_or_else(|| ((0.6 / self.a.fps as f64 / t_pass).round() as u32).max(1));
-        let mut paced = None;
-        for _ in 0..4 {
-            let (ok, r) = self.test(Kind::Paced, s0, self.a.measure, 0.0, Some(per_frame), true)?;
+        // Game-like load: about 60% busy at the target frame rate, so there are real idle gaps
+        // between frames (load changes every frame, like a game). Adjusts the passes per frame
+        // and, when one pass is already too much, the work per pass.
+        let mut pf = self.st.per_frame.unwrap_or(1).max(1);
+        let mut it = self.st.paced_iters.unwrap_or(self.a.iters_paced).max(1);
+        for attempt in 0..8 {
+            self.st.per_frame = Some(pf);
+            self.st.paced_iters = Some(it);
+            let (ok, r) = self.test(Kind::Paced, s0, 8.0, 0.0, None, true)?;
             let r = r
                 .filter(|_| ok)
                 .ok_or_else(|| fail("The stock game-like test failed."))?;
-            let busy = r.busy;
-            paced = Some(r);
-            if (0.45..=0.75).contains(&busy) || per_frame == 1 && busy > 0.45 {
+            if (0.45..=0.75).contains(&r.busy) {
                 break;
             }
-            per_frame = ((per_frame as f64 * 0.6 / busy.max(0.05)).round() as u32).max(1);
+            if attempt == 7 {
+                self.ui.event(
+                    "!",
+                    &format!(
+                        "couldn't tune the game-like load to 60% busy (now {:.0}%)",
+                        r.busy * 100.0
+                    ),
+                    Tone::Warn,
+                );
+                break;
+            }
+            let work = (pf * it) as f64 * 0.6 / r.busy.max(0.01);
+            if work >= 2.0 * it as f64 {
+                pf = (work / it as f64).round().max(1.0) as u32;
+            } else {
+                pf = 1;
+                it = (work.round() as u32).max(1);
+            }
         }
-        let paced = paced.unwrap();
-        self.st.per_frame = Some(per_frame);
+        let (ok, paced) = self.test(Kind::Paced, s0, self.a.measure, 0.0, None, true)?;
+        let paced = paced
+            .filter(|_| ok)
+            .ok_or_else(|| fail("The stock game-like test failed."))?;
         let key = self.params(Kind::Paced, 0.0, 0.0, None).golden_key();
         self.st
             .golden
             .insert(key, paced.hash.clone().unwrap_or_default());
+        self.ui.event(
+            "•",
+            &format!(
+                "game-like load: {pf} pass(es) of {it} steps per frame, {:.0}% busy at {} fps",
+                paced.busy * 100.0,
+                self.a.fps
+            ),
+            Tone::Normal,
+        );
         let (ok, paced2) = self.test(Kind::Paced, s0, self.a.measure, 0.0, None, true)?;
         let paced2 = paced2
             .filter(|_| ok)
@@ -688,6 +760,8 @@ impl<'a> Tuner<'a> {
                 paced_power: rel_noise(paced.avg_power, paced2.avg_power),
                 clk: rel_noise(paced.core_clk, paced2.core_clk),
             },
+            heavy_limited: limited,
+            power_limit_w: pl_w,
         };
         let n = &b.noise;
         self.ui.event(
@@ -1118,7 +1192,8 @@ impl<'a> Tuner<'a> {
             );
             self.ui.set_phase(
                 &format!("Core: highest stable offset at max {clk} MHz"),
-                "Higher offset = lower voltage at the same clock = less power. Searching with game-like bursts.",
+                "Higher offset = lower voltage at the same clock = less power. Each step: game-like bursts, then full \
+                 load at the power limit (high current is where undervolts fail).",
             );
             let hint = self.a.hints.get(&clk).copied();
             let secs = self.a.search_seconds;
@@ -1126,9 +1201,9 @@ impl<'a> Tuner<'a> {
                 |off| {
                     let s = self.set(off, mem, Some(clk));
                     let v = self.probe(&format!("core:{clk}:{mem}:{off}"), |t| {
-                        Ok(Value::Bool(
-                            t.test(Kind::Paced, s, secs, 0.0, None, false)?.0,
-                        ))
+                        let ok = t.test(Kind::Paced, s, secs, 0.0, None, false)?.0
+                            && t.test(Kind::Heavy, s, secs * 0.5, 0.0, None, false)?.0;
+                        Ok(Value::Bool(ok))
                     })?;
                     Ok(v.as_bool().unwrap_or(false))
                 },
@@ -1486,23 +1561,27 @@ const TEST_OVERHEAD: f64 = 5.0;
 pub fn est_pass1(p: &PassArgs) -> f64 {
     let steps = (p.mem_max / p.mem_step + 2) as f64;
     let n = p.clocks.len() as f64;
-    let tests = 6.0 + 2.0 + steps + 3.0 + n * 8.0;
+    // baseline (2 full, ~3 calibration + 2 game-like), calibration, memory, 6 search steps per
+    // clock (game-like + half as long full load each), measurement
+    let tests = 9.0 + 2.0 + steps + 3.0 + n * 14.0;
     p.warm
         + 5.0 * p.measure
+        + 3.0 * 8.0
         + 31.0
         + steps * p.mem_seconds
         + 3.0 * (p.combo_seconds + p.combo_warmup)
-        + n * (6.0 * p.search_seconds + 2.0 * p.measure + p.warmup)
+        + n * (6.0 * 1.5 * p.search_seconds + 2.0 * p.measure + p.warmup)
         + tests * TEST_OVERHEAD
 }
 
 pub fn est_pass2(p: &PassArgs) -> f64 {
     let n = 5.0;
-    let tests = 5.0 + 5.0 + n * 6.0;
+    let tests = 6.0 + 5.0 + n * 10.0;
     p.warm
         + 5.0 * p.measure
+        + 8.0
         + 5.0 * (p.combo_seconds + p.combo_warmup)
-        + n * (4.0 * p.search_seconds + 2.0 * p.measure + p.warmup)
+        + n * (4.0 * 1.5 * p.search_seconds + 2.0 * p.measure + p.warmup)
         + tests * TEST_OVERHEAD
 }
 
