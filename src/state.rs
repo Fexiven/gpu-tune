@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-pub const STATE_VERSION: u32 = 4;
+pub const STATE_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Noise {
@@ -86,10 +86,21 @@ pub struct PassState {
     pub tried: BTreeMap<String, Value>,
     /// the step that was running when the state was saved (a crash => failure)
     pub pending: Option<String>,
-    pub center: Option<u32>,
-    pub soak_at: Option<(i32, i32)>,
-    pub soak_done: bool,
-    pub soak_result: Option<Prof>,
+    /// pass 2: the clock caps it fine-tunes (re-planned if pass 1's picture changes)
+    #[serde(default)]
+    pub plan: Vec<u32>,
+    /// soak test per profile name ("efficient", "balanced", "max")
+    #[serde(default)]
+    pub soaks: BTreeMap<String, Soak>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Soak {
+    /// settings being soak-tested when the state was saved (a crash => back off from here)
+    pub at: Option<(i32, i32)>,
+    pub done: bool,
+    /// None after `done` = nothing passed
+    pub result: Option<Prof>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -113,9 +124,25 @@ pub struct Sig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResultRec {
+    /// the --goal profile (or the closest one that passed)
     pub recommended: Prof,
+    #[serde(default)]
+    pub recommended_name: String,
     pub baseline: Baseline,
+    /// every profile that passed its soak test, by name
     pub profiles: BTreeMap<String, Prof>,
+    /// profiles where nothing passed the soak test
+    #[serde(default)]
+    pub failed: Vec<String>,
+}
+
+/// Display name of a profile.
+pub fn profile_label(name: &str) -> &'static str {
+    match name {
+        "efficient" => "Efficient",
+        "max" => "Performance",
+        _ => "Balanced",
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

@@ -37,14 +37,18 @@ use ui::{Log, PlainUi, Tone, Ui};
     about = "Automatic overclock / undervolt finder for NVIDIA GPUs on Linux.",
     long_about = "Finds the best stable clock offset, clock cap and memory offset for your NVIDIA card, \
                         tested with Vulkan loads like games, and tells you what to enter in LACT.\n\n\
-                        Takes about 75 minutes (--quick-only: about 35 min). Ctrl+C stops safely at any time \
+                        Finds three profiles (efficient, balanced, performance), each soak-tested, in about 1 hour 45 minutes (--single: one profile, ~75 min; --quick-only: ~45 min). Ctrl+C stops safely at any time \
                         (GPU goes back to stock); run it again to continue where it stopped."
 )]
 struct Cli {
-    /// what to optimise for: balanced (stock speed, clearly less power), efficient (least power, ~2% slower at most), max
-    #[arg(long, default_value = "balanced", value_parser = ["balanced", "efficient", "max"])]
+    /// which profile to recommend (all three are found unless --single): balanced (stock speed, clearly less
+    /// power), efficient (least power, ~2% slower at most), performance (fastest; "max" works too)
+    #[arg(long, default_value = "balanced", value_parser = ["balanced", "efficient", "performance", "max"])]
     goal: String,
-    /// only the rough pass (~35 min)
+    /// only find and soak-test the --goal profile (faster, ~75 min)
+    #[arg(long)]
+    single: bool,
+    /// only the rough pass (~45 min, ~25 min with --single)
     #[arg(long)]
     quick_only: bool,
     /// ignore saved progress and start over
@@ -376,8 +380,7 @@ pub fn load_state(
     let note = if !old.done {
         "continuing the previous run from where it stopped"
     } else if old.quick_only && !quick_only {
-        old.p1.soak_done = false;
-        old.p1.soak_result = None;
+        old.p1.soaks.clear();
         "reusing your quick scan, going straight to fine-tuning"
     } else {
         return fresh("");
@@ -394,7 +397,10 @@ fn main() {
     if args.len() >= 3 && args[1] == "--worker" {
         work::worker_main(&args[2]);
     }
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if cli.goal == "performance" {
+        cli.goal = "max".into();
+    }
     if cli.self_test {
         if let Some(dev) = &cli.vulkan_device {
             let info = hw::GpuInfo {
@@ -482,11 +488,13 @@ fn main() {
 
     let p1 = PassArgs::for_pass(&base, true);
     let p2 = PassArgs::for_pass(&base, false);
+    let profiles = if cli.single { 1.0 } else { 3.0 };
     let est = tuner::est_pass1(&p1)
         + if cli.quick_only {
-            tuner::est_soak(&p1)
+            profiles * tuner::est_soak(&p1)
         } else {
-            tuner::est_pass2(&p2) + tuner::est_soak(&p2)
+            // three profiles: ~3 clock caps around each, partly shared
+            tuner::est_pass2(&p2, if cli.single { 5 } else { 8 }) + profiles * tuner::est_soak(&p2)
         };
     let t = unix_now() as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -578,7 +586,7 @@ fn main() {
         saver: &saver,
     };
     let t_start = std::time::Instant::now();
-    let res = flow::tune(&env, &base, &cli.goal, cli.quick_only);
+    let res = flow::tune(&env, &base, &cli.goal, cli.quick_only, cli.single);
     if res.is_ok() {
         std::thread::sleep(std::time::Duration::from_millis(2500)); // show the final state a moment
     }

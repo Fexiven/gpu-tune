@@ -357,7 +357,11 @@ fn run_with(card: Card, state: State, goal: &str, quick: bool, hook: Option<Hook
         log: &log,
         saver: &saver,
     };
-    let res = tune(&env, &a, goal, quick);
+    let (goal, single) = match goal.strip_prefix("single:") {
+        Some(g) => (g, true),
+        None => (goal, false),
+    };
+    let res = tune(&env, &a, goal, quick, single);
     let state = saver.state.lock().unwrap().clone();
     let events = ui.0.lock().unwrap().clone();
     Run {
@@ -399,7 +403,7 @@ fn run_shared(card: Card, state: State, make_hook: impl FnOnce(Arc<Saver>) -> Ho
         log: &log,
         saver: &saver,
     };
-    let res = tune(&env, &a, "balanced", false);
+    let res = tune(&env, &a, "balanced", false, false);
     let state = saver.state.lock().unwrap().clone();
     let events = ui.0.lock().unwrap().clone();
     Run {
@@ -452,11 +456,33 @@ fn finds_the_built_in_limits() {
         rec.mem, 1250,
         "last step before the simulated retries: {rec:?}"
     );
+    // all three profiles soak-tested; each within its clock's limit minus the margin (or lower,
+    // if the soak test made it back off), and ordered by power
+    let res = r.state.result.as_ref().unwrap();
+    assert_eq!(res.recommended_name, "balanced");
+    assert!(res.failed.is_empty(), "{:?}", res.failed);
+    let pr = |n: &str| {
+        res.profiles
+            .get(n)
+            .unwrap_or_else(|| panic!("{n} missing: {:?}", r.events))
+    };
+    for n in ["efficient", "balanced", "max"] {
+        let p = pr(n);
+        assert!(
+            p.core <= core_limit(Some(p.max_clock)) / 15 * 15 - 45,
+            "{n}: {p:?}"
+        );
+        assert!(p.core <= 200, "{n} must pass the idle check: {p:?}");
+    }
+    assert!(pr("efficient").paced_power <= pr("balanced").paced_power + 1.0);
+    assert!(pr("max").paced_clk >= pr("balanced").paced_clk - 1.0);
     let cal = r.state.p1.calib.as_ref().unwrap();
     assert_eq!(cal.pstate, Some(0));
     assert!((cal.k - 0.5).abs() < 1e-9);
     assert!(r.state.p1.baseline.as_ref().unwrap().noise.perf > 0.0);
-    assert!(r.state.p2.pending.is_none() && r.state.p2.soak_at.is_none());
+    assert!(
+        r.state.p2.pending.is_none() && r.state.p2.soaks.values().all(|s| s.at.is_none() && s.done)
+    );
     assert!(
         r.sim_minutes > 30.0 && r.sim_minutes < 120.0,
         "{} min",
@@ -470,8 +496,9 @@ fn idle_crash_backs_off_below_the_idle_limit() {
         idle_core_limit: 100,
         ..Default::default()
     });
-    let rec = &r.state.result.as_ref().unwrap().recommended;
-    assert!(rec.core <= 100, "{rec:?}");
+    for (n, p) in &r.state.result.as_ref().unwrap().profiles {
+        assert!(p.core <= 100, "{n}: {p:?}");
+    }
     assert!(r.events.iter().any(|e| e.contains("soak failed")));
 }
 
@@ -523,11 +550,19 @@ fn power_loss_in_the_search_is_counted_as_unstable_after_reboot() {
 
 #[test]
 fn power_loss_in_the_soak_backs_off_instead_of_looping() {
-    let disk = power_loss(|p, _, st| p.kind == Kind::Paced && st.p2.soak_at.is_some()); // the cold-start test
-    let at = disk.p2.soak_at.expect("soak position on disk");
+    // dies in the first profile's cold-start test
+    let disk = power_loss(|p, _, st| {
+        p.kind == Kind::Paced && st.p2.soaks.values().any(|s| s.at.is_some())
+    });
+    let (name, at) = disk
+        .p2
+        .soaks
+        .iter()
+        .find_map(|(n, s)| s.at.map(|a| (n.clone(), a)))
+        .expect("soak position on disk");
     let r = run_with(Card::default(), disk, "balanced", false, None);
-    let rec = &r.state.result.as_ref().unwrap().recommended;
-    assert_eq!(rec.core, at.0 - 15, "{at:?} -> {rec:?}");
+    let p = &r.state.result.as_ref().unwrap().profiles[&name];
+    assert_eq!(p.core, at.0 - 15, "{name}: {at:?} -> {p:?}");
     assert!(r.events.iter().any(|e| e.contains("died during the soak")));
 }
 
@@ -702,14 +737,44 @@ fn time_estimate_matches_a_simulated_run() {
     let gpu = FakeGpu::new(Card::default());
     let a = args(&gpu);
     let (p1, p2) = (PassArgs::for_pass(&a, true), PassArgs::for_pass(&a, false));
-    let est =
-        (crate::tuner::est_pass1(&p1) + crate::tuner::est_pass2(&p2) + crate::tuner::est_soak(&p2))
-            / 60.0;
     let r = run(Card::default());
+    let n = r.state.p2.plan.len();
+    let est = (crate::tuner::est_pass1(&p1)
+        + crate::tuner::est_pass2(&p2, n)
+        + 3.0 * crate::tuner::est_soak(&p2))
+        / 60.0;
+    eprintln!("pass 2 fine-tuned {n} clock caps");
     eprintln!("estimate {est:.0} min, simulated {:.0} min", r.sim_minutes);
     assert!(
         est > r.sim_minutes * 0.7 && est < r.sim_minutes * 1.4,
         "estimate {est:.0} vs simulated {:.0}",
         r.sim_minutes
     );
+}
+
+#[test]
+fn single_profile_mode_soaks_only_the_goal() {
+    let r = run_with(
+        Card::default(),
+        State::default(),
+        "single:efficient",
+        false,
+        None,
+    );
+    assert_eq!(r.res, Ok(()));
+    let res = r.state.result.as_ref().unwrap();
+    assert_eq!(res.profiles.keys().collect::<Vec<_>>(), vec!["efficient"]);
+    assert_eq!(r.state.p2.soaks.len(), 1);
+    assert_eq!(r.state.p2.plan.len(), 5);
+}
+
+#[test]
+#[ignore]
+fn print_sample_report() {
+    let r = run(Card::default());
+    println!(
+        "{}",
+        crate::report::report_text(&FakeGpu::new(Card::default()), &r.state, "balanced")
+    );
+    println!("\n[simulated {:.0} min]", r.sim_minutes);
 }

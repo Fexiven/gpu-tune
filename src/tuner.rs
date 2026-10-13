@@ -1428,10 +1428,11 @@ impl<'a> Tuner<'a> {
 
     /// Longer mixed test of the result: cold start, full load, game-like load, memory with a
     /// hot GPU, desktop idle. Returns the confirmed profile with numbers from these longer
-    /// tests, or None if nothing passes (keep stock).
-    pub fn soak(&mut self, prof: &Prof) -> R<Option<Prof>> {
-        if self.st.soak_done {
-            return Ok(self.st.soak_result.clone());
+    /// tests, or None if nothing passes. Each profile (`name`) has its own soak record.
+    pub fn soak(&mut self, name: &str, prof: &Prof) -> R<Option<Prof>> {
+        let rec = self.st.soaks.entry(name.to_string()).or_default().clone();
+        if rec.done {
+            return Ok(rec.result);
         }
         let pl = if prof.power_max {
             self.gpu.info().max_pl
@@ -1440,7 +1441,7 @@ impl<'a> Tuner<'a> {
         };
         let (mut core, mut mem, clk) = (prof.core, prof.mem, prof.max_clock);
         let step = self.a.core_step;
-        if let Some((c, m)) = self.st.soak_at {
+        if let Some((c, m)) = rec.at {
             // the computer died during the soak last time
             (core, mem) = (c, m);
             if core > 0 {
@@ -1448,12 +1449,12 @@ impl<'a> Tuner<'a> {
             } else if mem > 0 {
                 mem = (mem - 250).max(0);
             } else {
-                return self.finish_soak(None);
+                return self.finish_soak(name, None);
             }
             self.ui.event("!", &format!("the last run died during the soak test: backing off to core {core:+}, mem {mem:+}"), Tone::Warn);
         }
         loop {
-            self.st.soak_at = Some((core, mem));
+            self.st.soaks.entry(name.to_string()).or_default().at = Some((core, mem));
             self.save();
             let s = Settings {
                 core,
@@ -1520,7 +1521,7 @@ impl<'a> Tuner<'a> {
                         paced_clk: p.core_clk,
                         ..prof.clone()
                     };
-                    return self.finish_soak(Some(r));
+                    return self.finish_soak(name, Some(r));
                 }
                 Some(f) => {
                     if f == Fail::Mem && mem > 0 {
@@ -1530,7 +1531,7 @@ impl<'a> Tuner<'a> {
                     } else if mem > 0 {
                         mem = (mem - 250).max(0);
                     } else {
-                        return self.finish_soak(None);
+                        return self.finish_soak(name, None);
                     }
                     self.ui.event(
                         "!",
@@ -1542,14 +1543,27 @@ impl<'a> Tuner<'a> {
         }
     }
 
-    fn finish_soak(&mut self, r: Option<Prof>) -> R<Option<Prof>> {
-        self.st.soak_result = r.clone();
-        self.st.soak_done = true;
-        self.st.soak_at = None;
+    fn finish_soak(&mut self, name: &str, r: Option<Prof>) -> R<Option<Prof>> {
+        let s = self.st.soaks.entry(name.to_string()).or_default();
+        s.result = r.clone();
+        s.done = true;
+        s.at = None;
         self.save();
+        let label = crate::state::profile_label(name);
         match &r {
-            Some(_) => self.ui.event("★", "soak test passed", Tone::Star),
-            None => self.ui.event("✗", "soak test failed even at +0", Tone::Bad),
+            Some(p) => self.ui.event(
+                "★",
+                &format!(
+                    "{label}: soak test passed (max {} MHz, core {:+}, mem {:+})",
+                    p.max_clock, p.core, p.mem
+                ),
+                Tone::Star,
+            ),
+            None => self.ui.event(
+                "✗",
+                &format!("{label}: soak test failed even at +0"),
+                Tone::Bad,
+            ),
         }
         Ok(r)
     }
@@ -1574,8 +1588,8 @@ pub fn est_pass1(p: &PassArgs) -> f64 {
         + tests * TEST_OVERHEAD
 }
 
-pub fn est_pass2(p: &PassArgs) -> f64 {
-    let n = 5.0;
+pub fn est_pass2(p: &PassArgs, n_clocks: usize) -> f64 {
+    let n = n_clocks as f64;
     let tests = 6.0 + 5.0 + n * 10.0;
     p.warm
         + 5.0 * p.measure

@@ -1,9 +1,10 @@
 # gpu-tune
 
-Automatic overclock / undervolt finder for NVIDIA GPUs on Linux. It finds the best stable
-**core clock offset**, **clock cap** and **memory offset** for your card and tells you what to
-enter in [LACT](https://github.com/ilya-zlobintsev/LACT). It takes about 75 minutes, and you can
-stop and continue at any time.
+Automatic overclock / undervolt finder for NVIDIA GPUs on Linux. It finds three soak-tested
+profiles for your card (**efficient**, **balanced**, **performance**), each a core clock offset,
+clock cap and memory offset, and tells you what to enter in
+[LACT](https://github.com/ilya-zlobintsev/LACT) (save them as LACT profiles). It takes about
+1 hour 40 minutes (`--single`: one profile, ~75 min), and you can stop and continue at any time.
 
 Made for the RTX 4080 Super; works on RTX 30/40/50 cards with the proprietary driver (555+ recommended).
 
@@ -17,16 +18,17 @@ It asks for your sudo password (changing clocks needs root), shows a live dashbo
 with something like:
 
 ```
-Recommended (balanced):
-   game-like load:  core clock -0.4% vs stock, -25 W at a fixed 120 fps
-   full load:       +3.2% performance, -1 W
-   Tested up to the power limit: full load drew 318 W at stock (320 W limit), 316 W tuned.
+3 profiles, each soak-tested. Save them as LACT profiles and switch as you like.
+Tested up to the power limit: full load drew 317 W at stock (320 W limit).
 
-Enter in LACT (for P0, the highest P-state):
-   GPU clock offset    +150 MHz
-   VRAM clock offset   +1250 MHz
-   Maximum GPU clock   2790 MHz
-   Power limit         320 W (default)
+Efficient  (least power, at most ~2% slower than stock)
+   game-like load:  core clock -1.4% vs stock, -32 W at a fixed 120 fps
+   LACT (P0):       GPU clock offset +150, VRAM clock offset +1250, maximum GPU clock 2760 MHz, ...
+
+★ Balanced  (stock speed or better, clearly less power)
+   ...
+Performance  (fastest)
+   ...
 ```
 
 While it runs, the computer won't go to sleep (it holds a systemd-logind inhibitor, released
@@ -41,10 +43,9 @@ counted as unstable next time.
 
 | | |
 |---|---|
-| `--goal balanced` | stock speed in games with clearly less power (default) |
-| `--goal efficient` | least power while at most ~2% slower |
-| `--goal max` | most performance |
-| `--quick-only` | only the rough pass (~35 min) |
+| `--goal balanced` | which profile is marked as recommended (default; also `efficient`, `performance`) |
+| `--single` | only find and soak-test the `--goal` profile (~75 min) |
+| `--quick-only` | only the rough pass (~45 min, ~25 with `--single`) |
 | `--self-test` | proves the error detection works on your machine (injects errors on purpose) |
 | `--game-check` | at the end, compare stock vs result in your own benchmark |
 | `--check-vram` | only test the memory temperature sensor |
@@ -83,8 +84,8 @@ pattern and checks every word. Each test runs in its own process, so a crash onl
    the game-like load (bursts at 120 fps, load changing every frame) and then the full load at
    the power limit. A higher offset at the same clock cap means lower voltage, so less power. The
    result is used with a 45 MHz safety margin (longer tests find lower limits).
-5. Pass 2 repeats steps 3-4 around the best area with full-length tests and finer steps.
-6. Soak test of the result: cold start, full load, game-like load, memory with a hot GPU, and
+5. Pass 2 repeats steps 3-4 around each profile's area with full-length tests and finer steps.
+6. Soak test of each profile: cold start, full load, game-like load, memory with a hot GPU, and
    **desktop idle with sudden load**. An offset shifts the whole voltage/frequency curve,
    including the low idle points, which is where Linux undervolts often crash.
 

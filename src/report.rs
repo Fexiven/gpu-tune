@@ -1,98 +1,109 @@
 //! The final summary (also saved to gpu_tune_result.txt) and the optional benchmark check.
 
 use crate::hw::{Gpu, Settings};
-use crate::state::{State, give_back};
+use crate::state::{State, give_back, profile_label};
 use crate::tuner::game_rel;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub fn report_text(gpu: &dyn Gpu, st: &State, goal: &str) -> String {
+pub fn report_text(gpu: &dyn Gpu, st: &State, _goal: &str) -> String {
     let info = gpu.info();
     let cal = st.p1.calib.clone().unwrap_or_default();
     let mut l: Vec<String> = vec![];
     let Some(res) = &st.result else {
         return "No tuned setting passed all tests. Keep your card at stock.".into();
     };
-    let (rec, b) = (&res.recommended, &res.baseline);
-    let pl = if rec.power_max {
-        format!("{:.0} W (max)", info.max_pl as f64 / 1000.0)
+    let b = &res.baseline;
+    let n = res.profiles.len();
+    l.push(if n > 1 {
+        format!(
+            "{n} profiles, each soak-tested. Save them as LACT profiles and switch as you like."
+        )
     } else {
-        format!("{:.0} W (default)", info.default_pl as f64 / 1000.0)
-    };
-    l.push(format!("Recommended ({goal}):"));
-    l.push(format!(
-        "   game-like load:  core clock {:+.1}% vs stock, {:+.0} W at a fixed 120 fps",
-        (game_rel(rec, b) - 1.0) * 100.0,
-        rec.paced_power - b.paced_power
-    ));
-    l.push(format!(
-        "   full load:       {:+.1}% performance, {:+.0} W",
-        (rec.perf / b.perf - 1.0) * 100.0,
-        rec.heavy_power - b.heavy_power
-    ));
-    l.push(
-        "   (the clock figure doesn't include the memory overclock; check fps with --game-check)"
-            .into(),
-    );
+        "Result (soak-tested):".to_string()
+    });
     if b.heavy_limited {
         l.push(format!(
-            "   Tested up to the power limit: full load drew {:.0} W at stock ({:.0} W limit), {:.0} W tuned.",
-            b.heavy_power, b.power_limit_w, rec.heavy_power
+            "Tested up to the power limit: full load drew {:.0} W at stock ({:.0} W limit).",
+            b.heavy_power, b.power_limit_w
         ));
     } else if b.power_limit_w > 0.0 {
         l.push(format!(
-            "   Note: the full load only reached {:.0} W of {:.0} W, so the core offset is untested at full gaming power.",
+            "Note: the full load only reached {:.0} W of {:.0} W, so core offsets are untested at full gaming power.",
             b.heavy_power, b.power_limit_w
         ));
-        l.push("   Check it in your most demanding game; lower the GPU clock offset by 15-30 if it crashes.".into());
+        l.push("Check them in your most demanding game; lower the GPU clock offset by 15-30 if it crashes.".into());
+    }
+    for name in crate::flow::PROFILE_NAMES {
+        let Some(p) = res.profiles.get(name) else {
+            continue;
+        };
+        let star = name == res.recommended_name;
+        let pl = if p.power_max {
+            format!("{:.0} W (max)", info.max_pl as f64 / 1000.0)
+        } else {
+            format!("{:.0} W (default)", info.default_pl as f64 / 1000.0)
+        };
+        l.push(String::new());
+        l.push(format!(
+            "{}{}{}",
+            if star { "★ " } else { "" },
+            profile_label(name),
+            match name {
+                "efficient" => "  (least power, at most ~2% slower than stock)",
+                "max" => "  (fastest)",
+                _ => "  (stock speed or better, clearly less power)",
+            }
+        ));
+        l.push(format!(
+            "   game-like load:  core clock {:+.1}% vs stock, {:+.0} W at a fixed 120 fps",
+            (game_rel(p, b) - 1.0) * 100.0,
+            p.paced_power - b.paced_power
+        ));
+        l.push(format!(
+            "   full load:       {:+.1}% performance, {:+.0} W ({:.0} W)",
+            (p.perf / b.perf - 1.0) * 100.0,
+            p.heavy_power - b.heavy_power,
+            p.heavy_power
+        ));
+        l.push(format!(
+            "   LACT (P0):       GPU clock offset {:+}, VRAM clock offset {:+}, maximum GPU clock {} MHz, power limit {pl}",
+            p.core, p.mem, p.max_clock
+        ));
+        if let Some(v) = p.vram_max {
+            l.push(format!(
+                "   memory temp:     up to {v:.0}°C in the soak test{}",
+                if v >= 90.0 {
+                    " (warm: consider a lower VRAM offset for daily use)"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+    for f in &res.failed {
+        l.push(String::new());
+        l.push(format!(
+            "{}: nothing passed the soak test, so there's no setting for this profile.",
+            profile_label(f)
+        ));
     }
     l.push(String::new());
     l.push(
-        "Enter in LACT (for P0, the highest P-state, if LACT shows one row per P-state):".into(),
+        "(clock figures don't include the memory overclock; compare fps with --game-check)".into(),
     );
-    l.push(format!("   GPU clock offset    {:+} MHz", rec.core));
-    l.push(format!("   VRAM clock offset   {:+} MHz", rec.mem));
-    l.push(format!("   Maximum GPU clock   {} MHz", rec.max_clock));
-    l.push(format!("   Power limit         {pl}"));
+    let rec = &res.recommended;
     if cal.k > 0.0 && rec.mem != 0 {
         l.push(format!(
-            "Check: in a game, nvidia-smi should show the memory at about {:.0} MHz (stock {:.0} MHz).",
+            "Check: in a game, nvidia-smi should show the memory at about {:.0} MHz with VRAM {:+} (stock {:.0} MHz).",
             cal.mem_clk + rec.mem as f64 * cal.k,
+            rec.mem,
             cal.mem_clk
         ));
-        l.push("   If it's off by half or double the change, LACT uses different offset units: adjust the VRAM value.".into());
     }
-    if let Some(v) = rec.vram_max {
-        l.push(format!(
-            "Memory temperature: up to {v:.0}°C during the soak test{}",
-            if v >= 90.0 {
-                "  (warm: consider a lower VRAM offset for daily use)"
-            } else {
-                "  (fine)"
-            }
-        ));
-    }
+    l.push("Keep each profile's offset and maximum clock together: the offset without the cap is untested.".into());
     l.push(String::new());
-    let others: Vec<_> = res
-        .profiles
-        .iter()
-        .filter(|(n, p)| n.as_str() != goal && p.max_clock != rec.max_clock)
-        .collect();
-    if !others.is_empty() {
-        l.push("Other options from this run (not soak-tested):".into());
-        for (n, p) in others {
-            l.push(format!(
-                "   {n:<10} max {} MHz, core {:+}, mem {:+}: clock {:+.1}%, {:+.0} W at 120 fps",
-                p.max_clock,
-                p.core,
-                p.mem,
-                (game_rel(p, b) - 1.0) * 100.0,
-                p.paced_power - b.paced_power
-            ));
-        }
-        l.push(String::new());
-    }
     l.extend(
         [
             "Next:",
