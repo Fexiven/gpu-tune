@@ -41,6 +41,7 @@ pub struct GpuInfo {
     #[allow(dead_code)] // kept for diagnostics
     pub dev_id: u32,
     pub default_pl: u32,
+    pub min_pl: u32,
     pub max_pl: u32,
     pub core_range: (i32, i32),
     pub mem_range: (i32, i32),
@@ -77,7 +78,7 @@ impl RealGpu {
         let nvml = Arc::new(Nvml::load()?);
         let h = nvml.handle(index)?;
         let (bus, dev_id) = nvml.pci(h)?;
-        let (_, max_pl) = nvml.power_constraints(h)?;
+        let (min_pl, max_pl) = nvml.power_constraints(h)?;
         let pstate_api = nvml.has_pstate_offsets()
             && nvml
                 .get_offset(h, nvml::CLOCK_GRAPHICS, nvml::PSTATE_0)
@@ -107,6 +108,7 @@ impl RealGpu {
             bus: bus.clone(),
             dev_id,
             default_pl: nvml.power_default(h)?,
+            min_pl,
             max_pl,
             core_range,
             mem_range,

@@ -93,6 +93,16 @@ enum Fail {
     Mem,
 }
 
+/// The power limit a profile runs with: the card's maximum (performance profile, if it helped),
+/// a lower limit found by the power search, or the default.
+pub fn prof_power(p: &Prof, info: &crate::hw::GpuInfo) -> u32 {
+    if p.power_max {
+        info.max_pl
+    } else {
+        p.power_limit_mw.unwrap_or(info.default_pl)
+    }
+}
+
 pub fn rel_noise(a: f64, b: f64) -> f64 {
     let m = (a.abs() + b.abs()) / 2.0;
     if m > 0.0 { (a - b).abs() / m } else { 0.0 }
@@ -1281,6 +1291,7 @@ impl<'a> Tuner<'a> {
             temp: h.temp.max(p.temp),
             limited_by: h.limited_by,
             power_max: false,
+            power_limit_mw: None,
             vram_max: None,
         })
         .unwrap())
@@ -1353,6 +1364,107 @@ impl<'a> Tuner<'a> {
                 })
             }
             _ => Ok(prof),
+        }
+    }
+
+    /// Looks for a lower power limit for a profile: full load with its settings at 100/90/80/70%
+    /// of the default limit. Keeps the lowest limit that costs at most `max_loss` full-load
+    /// performance and saves clearly more power than the measurement noise. Stops at the first
+    /// limit that is unstable: under a power limit the card runs lower points of the shifted
+    /// voltage/frequency curve, which the soak test at the chosen limit then confirms.
+    pub fn power_search(&mut self, name: &str, prof: Prof, max_loss: f64) -> R<Prof> {
+        let info = self.gpu.info().clone();
+        let label = crate::state::profile_label(name);
+        let (measure, warmup) = (self.a.measure, self.a.warmup);
+        let noise = self
+            .st
+            .baseline
+            .as_ref()
+            .map(|b| b.noise.clone())
+            .unwrap_or_default();
+        self.ui.set_phase(
+            &format!("{label}: looking for a lower power limit"),
+            "Full load at 100, 90, 80 and 70% of the power limit. A lower limit is kept if it saves clearly more \
+             power than it costs performance.",
+        );
+        let mut base: Option<(f64, f64)> = None;
+        let mut best: Option<(u32, u32, f64, f64)> = None;
+        for pct in [100u32, 90, 80, 70] {
+            let pl = (info.default_pl as u64 * pct as u64 / 100) as u32;
+            if pl < info.min_pl {
+                break;
+            }
+            let s = Settings {
+                core: prof.core,
+                mem: prof.mem,
+                clock: Some(prof.max_clock),
+                power_mw: pl,
+            };
+            let v = self.probe(
+                &format!("pl:{}:{}:{}:{pct}", prof.max_clock, prof.core, prof.mem),
+                |t| {
+                    let (ok, r) = t.test(Kind::Heavy, s, measure, warmup, None, false)?;
+                    Ok(r.filter(|_| ok).map_or(
+                        Value::Bool(false),
+                        |r| json!({"perf": r.perf, "power": r.avg_power}),
+                    ))
+                },
+            )?;
+            let (Some(perf), Some(power)) = (v["perf"].as_f64(), v["power"].as_f64()) else {
+                self.ui.event(
+                    "•",
+                    &format!("{label}: {pct}% power limit is unstable with these settings"),
+                    Tone::Warn,
+                );
+                break;
+            };
+            let Some((p0, w0)) = base else {
+                base = Some((perf, power));
+                continue;
+            };
+            let (loss, save) = (1.0 - perf / p0, 1.0 - power / w0);
+            if loss > max_loss {
+                self.ui.event(
+                    "•",
+                    &format!(
+                        "{label}: {pct}% power limit costs {:.1}% performance, too much",
+                        loss * 100.0
+                    ),
+                    Tone::Normal,
+                );
+                break;
+            }
+            if save > 0.03f64.max(3.0 * noise.heavy_power) {
+                best = Some((pct, pl, perf, power));
+            }
+        }
+        match (best, base) {
+            (Some((pct, pl, perf, power)), Some((p0, w0))) => {
+                self.ui.event(
+                    "★",
+                    &format!(
+                        "{label}: power limit {:.0} W ({pct}%) saves {:.0}% power at full load for {:.1}% performance",
+                        pl as f64 / 1000.0,
+                        (1.0 - power / w0) * 100.0,
+                        (1.0 - perf / p0) * 100.0
+                    ),
+                    Tone::Star,
+                );
+                Ok(Prof {
+                    power_limit_mw: Some(pl),
+                    perf,
+                    heavy_power: power,
+                    ..prof
+                })
+            }
+            _ => {
+                self.ui.event(
+                    "•",
+                    &format!("{label}: a lower power limit doesn't pay off, keeping the default"),
+                    Tone::Normal,
+                );
+                Ok(prof)
+            }
         }
     }
 
@@ -1434,11 +1546,7 @@ impl<'a> Tuner<'a> {
         if rec.done {
             return Ok(rec.result);
         }
-        let pl = if prof.power_max {
-            self.gpu.info().max_pl
-        } else {
-            self.dpl()
-        };
+        let pl = prof_power(prof, self.gpu.info());
         let (mut core, mut mem, clk) = (prof.core, prof.mem, prof.max_clock);
         let step = self.a.core_step;
         if let Some((c, m)) = rec.at {
@@ -1597,6 +1705,11 @@ pub fn est_pass2(p: &PassArgs, n_clocks: usize) -> f64 {
         + 5.0 * (p.combo_seconds + p.combo_warmup)
         + n * (4.0 * 1.5 * p.search_seconds + 2.0 * p.measure + p.warmup)
         + tests * TEST_OVERHEAD
+}
+
+/// power-limit search for one profile: four full-load tests
+pub fn est_power(p: &PassArgs) -> f64 {
+    4.0 * (p.measure + p.warmup + TEST_OVERHEAD)
 }
 
 pub fn est_soak(p: &PassArgs) -> f64 {

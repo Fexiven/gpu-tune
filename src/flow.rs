@@ -20,8 +20,8 @@ pub const PROFILE_NAMES: [&str; 3] = ["efficient", "balanced", "max"];
 
 /// Soak result per profile name (None = nothing passed).
 type Soaked = BTreeMap<String, Option<Prof>>;
-/// (max clock, core offset, memory offset, max power limit): profiles with equal keys are tested once
-type SettingsKey = (u32, i32, i32, bool);
+/// (max clock, core offset, memory offset, power limit): profiles with equal keys are tested once
+type SettingsKey = (u32, i32, i32, u32);
 
 /// Which profiles to find: all three, or only the goal (`--single`).
 pub fn wanted(goal: &str, single: bool) -> Vec<&str> {
@@ -200,10 +200,18 @@ fn soak_all(e: &Env, t: &mut Tuner, profs: &Profiles, names: &[&str]) -> R<Soake
     let mut by_settings: Vec<(SettingsKey, Option<Prof>)> = vec![];
     for (i, n) in names.iter().enumerate() {
         let mut p = profs.get(n).clone();
-        if *n == "max" {
-            p = t.maxpower(p)?;
-        }
-        let key = (p.max_clock, p.core, p.mem, p.power_max);
+        p = match *n {
+            "max" => t.maxpower(p)?,
+            // lower power limit, if it costs at most this much full-load performance
+            "efficient" => t.power_search(n, p, 0.03)?,
+            _ => t.power_search(n, p, 0.01)?,
+        };
+        let key = (
+            p.max_clock,
+            p.core,
+            p.mem,
+            crate::tuner::prof_power(&p, e.gpu.info()),
+        );
         if let Some((_, r)) = by_settings.iter().find(|(k, _)| *k == key) {
             e.ui.event(
                 "•",

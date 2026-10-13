@@ -4,7 +4,7 @@ Automatic overclock / undervolt finder for NVIDIA GPUs on Linux. It finds three 
 profiles for your card (**efficient**, **balanced**, **performance**), each a core clock offset,
 clock cap and memory offset, and tells you what to enter in
 [LACT](https://github.com/ilya-zlobintsev/LACT) (save them as LACT profiles). It takes about
-1 hour 40 minutes (`--single`: one profile, ~75 min), and you can stop and continue at any time.
+1 hour 50 minutes (`--single`: one profile, ~80 min), and you can stop and continue at any time.
 
 Made for the RTX 4080 Super; works on RTX 30/40/50 cards with the proprietary driver (555+ recommended).
 
@@ -44,7 +44,7 @@ counted as unstable next time.
 | | |
 |---|---|
 | `--goal balanced` | which profile is marked as recommended (default; also `efficient`, `performance`) |
-| `--single` | only find and soak-test the `--goal` profile (~75 min) |
+| `--single` | only find and soak-test the `--goal` profile (~80 min) |
 | `--quick-only` | only the rough pass (~45 min, ~25 with `--single`) |
 | `--self-test` | proves the error detection works on your machine (injects errors on purpose) |
 | `--game-check` | at the end, compare stock vs result in your own benchmark |
@@ -85,7 +85,13 @@ pattern and checks every word. Each test runs in its own process, so a crash onl
    the power limit. A higher offset at the same clock cap means lower voltage, so less power. The
    result is used with a 45 MHz safety margin (longer tests find lower limits).
 5. Pass 2 repeats steps 3-4 around each profile's area with full-length tests and finer steps.
-6. Soak test of each profile: cold start, full load, game-like load, memory with a hot GPU, and
+6. Power limit (efficient and balanced profiles): full load with the profile's settings at
+   100/90/80/70% of the default power limit. The lowest limit that costs at most 3% (efficient)
+   or 1% (balanced) full-load performance and saves clearly more power than the noise is kept.
+   The performance profile instead checks whether the card's maximum limit adds performance.
+   (Running every test at several limits wouldn't find a better result: stability is decided at
+   the highest current, and the limit only matters when the card is power-limited.)
+7. Soak test of each profile, at its power limit: cold start, full load, game-like load, memory with a hot GPU, and
    **desktop idle with sudden load**. An offset shifts the whole voltage/frequency curve,
    including the low idle points, which is where Linux undervolts often crash.
 

@@ -69,6 +69,7 @@ impl FakeGpu {
                 bus: "0000:01:00.0".into(),
                 dev_id: 0x2702,
                 default_pl: 320_000,
+                min_pl: 150_000,
                 max_pl: 352_000,
                 core_range: (-1000, 1000),
                 mem_range: (-2000, 6000),
@@ -233,13 +234,22 @@ impl Runner for FakeRunner {
                 Kind::Heavy => {
                     let h = clk.min(2650.0 + core as f64 * 0.6);
                     summ.core_clk = h;
-                    // more math per step = more power, until the 320 W limit (needs alu 256)
+                    // more math per step = more power (needs alu 256 to reach 320 W at stock);
+                    // an undervolt (lower voltage at the same clock) draws less: power ~ V^2
                     let want = (100.0 + p.alu as f64 * 0.85).min(c.heavy_max_w);
-                    summ.power = self.noise(want.min(318.0), 0.002);
-                    if want >= 318.0 {
+                    let natural = want * volt.min(1.0).powi(2);
+                    // the power limit holds the card below its natural draw, costing some speed
+                    let cap = s.power_mw as f64 / 1000.0 - 2.0;
+                    let (power, slow) = if natural >= cap {
+                        (cap, (cap / natural).powf(0.25))
+                    } else {
+                        (natural, 1.0)
+                    };
+                    summ.power = self.noise(power, 0.002);
+                    if natural >= cap {
                         summ.limit = "power".into();
                     }
-                    r.perf = Some(self.noise(52.0 * h / 2650.0, 0.002));
+                    r.perf = Some(self.noise(52.0 * h / 2650.0 * slow, 0.002));
                     r.hash = Some("H".into());
                 }
                 _ => {
@@ -475,6 +485,14 @@ fn finds_the_built_in_limits() {
         assert!(p.core <= 200, "{n} must pass the idle check: {p:?}");
     }
     assert!(pr("efficient").paced_power <= pr("balanced").paced_power + 1.0);
+    // power search: efficient (3% allowed) gets a lower limit, balanced (1%) keeps the default
+    assert_eq!(
+        pr("efficient").power_limit_mw,
+        Some(256_000),
+        "{:?}",
+        pr("efficient")
+    );
+    assert_eq!(pr("balanced").power_limit_mw, None, "{:?}", pr("balanced"));
     assert!(pr("max").paced_clk >= pr("balanced").paced_clk - 1.0);
     let cal = r.state.p1.calib.as_ref().unwrap();
     assert_eq!(cal.pstate, Some(0));
@@ -741,7 +759,8 @@ fn time_estimate_matches_a_simulated_run() {
     let n = r.state.p2.plan.len();
     let est = (crate::tuner::est_pass1(&p1)
         + crate::tuner::est_pass2(&p2, n)
-        + 3.0 * crate::tuner::est_soak(&p2))
+        + 3.0 * crate::tuner::est_soak(&p2)
+        + 2.0 * crate::tuner::est_power(&p2))
         / 60.0;
     eprintln!("pass 2 fine-tuned {n} clock caps");
     eprintln!("estimate {est:.0} min, simulated {:.0} min", r.sim_minutes);

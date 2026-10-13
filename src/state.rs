@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-pub const STATE_VERSION: u32 = 5;
+pub const STATE_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Noise {
@@ -60,6 +60,9 @@ pub struct Prof {
     pub limited_by: String,
     #[serde(default)]
     pub power_max: bool,
+    /// a lower power limit found for this profile (None = default limit)
+    #[serde(default)]
+    pub power_limit_mw: Option<u32>,
     #[serde(default)]
     pub vram_max: Option<f64>,
 }

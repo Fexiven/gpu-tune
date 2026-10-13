@@ -40,10 +40,14 @@ pub fn report_text(gpu: &dyn Gpu, st: &State, _goal: &str) -> String {
             continue;
         };
         let star = name == res.recommended_name;
-        let pl = if p.power_max {
-            format!("{:.0} W (max)", info.max_pl as f64 / 1000.0)
-        } else {
-            format!("{:.0} W (default)", info.default_pl as f64 / 1000.0)
+        let pl = match (p.power_max, p.power_limit_mw) {
+            (true, _) => format!("{:.0} W (max)", info.max_pl as f64 / 1000.0),
+            (false, Some(mw)) => format!(
+                "{:.0} W ({:.0}% of default)",
+                mw as f64 / 1000.0,
+                mw as f64 / info.default_pl.max(1) as f64 * 100.0
+            ),
+            (false, None) => format!("{:.0} W (default)", info.default_pl as f64 / 1000.0),
         };
         l.push(String::new());
         l.push(format!(

@@ -37,7 +37,7 @@ use ui::{Log, PlainUi, Tone, Ui};
     about = "Automatic overclock / undervolt finder for NVIDIA GPUs on Linux.",
     long_about = "Finds the best stable clock offset, clock cap and memory offset for your NVIDIA card, \
                         tested with Vulkan loads like games, and tells you what to enter in LACT.\n\n\
-                        Finds three profiles (efficient, balanced, performance), each soak-tested, in about 1 hour 45 minutes (--single: one profile, ~75 min; --quick-only: ~45 min). Ctrl+C stops safely at any time \
+                        Finds three profiles (efficient, balanced, performance), each soak-tested, in about 1 hour 50 minutes (--single: one profile, ~75 min; --quick-only: ~45 min). Ctrl+C stops safely at any time \
                         (GPU goes back to stock); run it again to continue where it stopped."
 )]
 struct Cli {
@@ -409,6 +409,7 @@ fn main() {
                 bus: dev.clone(),
                 dev_id: 0,
                 default_pl: 0,
+                min_pl: 0,
                 max_pl: 0,
                 core_range: hw::HARD_CORE,
                 mem_range: hw::HARD_MEM,
@@ -491,10 +492,12 @@ fn main() {
     let profiles = if cli.single { 1.0 } else { 3.0 };
     let est = tuner::est_pass1(&p1)
         + if cli.quick_only {
-            profiles * tuner::est_soak(&p1)
+            profiles * (tuner::est_soak(&p1) + tuner::est_power(&p1))
         } else {
-            // three profiles: ~3 clock caps around each, partly shared
-            tuner::est_pass2(&p2, if cli.single { 5 } else { 8 }) + profiles * tuner::est_soak(&p2)
+            // three profiles: ~3 clock caps around each, partly shared; power search for two
+            tuner::est_pass2(&p2, if cli.single { 5 } else { 8 })
+                + profiles * tuner::est_soak(&p2)
+                + profiles.min(2.0) * tuner::est_power(&p2)
         };
     let t = unix_now() as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -631,11 +634,7 @@ fn main() {
         && let Some(r) = &st.result
     {
         let rec = &r.recommended;
-        let pl = if rec.power_max {
-            info.max_pl
-        } else {
-            info.default_pl
-        };
+        let pl = tuner::prof_power(rec, &info);
         report::game_check(
             gpu.clone(),
             Settings {
